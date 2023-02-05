@@ -1,0 +1,144 @@
+---
+title: "Deduplicate search results"
+output: html_notebook
+---
+
+This process follows [the registration](https://osf.io/f5qdn) created after this meta-analysis was accepted in principle by the Journal of Business and Psychology.
+
+# Packages used and set-up
+
+```{r}
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(reticulate, tidyr, dplyr, jsonlite, purrr, stringr, rcrossref, bib2df, furrr,
+               shiny, shinythemes, progress, progressr, keys, shinyjs, readr, synthesisr,
+               rvest, glue, magrittr, qs)
+
+pacman::p_load_gh("gadenbuie/shinyThings")
+
+#Enable progress updates
+#handlers(global = TRUE) <- this needs to be run in the console for now
+ handlers(handler_progress(
+     format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+     width    = 60,
+     complete = "=",
+     clear = FALSE
+   ))
+
+ options(progressr.clear = FALSE)
+
+ 
+#Adds progress bars to map and future_map functions
+showing_progress <- function(x, fn, fn2, ..., steps = length(x)) {
+  if(interactive() && !handlers(global = NA)) stop("To use this function, first run `handlers(global = TRUE)` in the console")
+   p <- progressr::progressor(steps = steps)
+   p(amount = 0)
+   fn(x, function(...) {
+     out <- fn2(...)
+     p()
+     out
+   })
+}
+
+
+set.seed(1234)
+
+#Import
+source("API_keys.R")
+source("crossref_and_related.R") #Functions to retrieve and edit citations
+source("helpers.R") #Helper functions - sometimes simple wrappers to deal safely with NULLs
+
+source_python("get_scrape_functions.py")
+
+library(magrittr)
+
+```
+
+
+## Searches in other languages
+
+### Run Google Scholar search per language
+
+For instance in German:
+
+("Kontakthypothese" OR "Inter* Kontakt" OR Interkultureller Kontakt“) AND ("Arbeit" ODER "Arbeitsplatz") AND ("Vorurteil" OR "Einstellungen")
+
+```{r}
+pacman::p_load(googleLanguageR)
+gl_auth("google_translate.json")
+translate <- function(x, drop_tags = TRUE) {
+  if (drop_tags) {
+    x <- str_replace_all(x, "<.*?>", " ")
+  }
+  which_NA <- is.na(x)
+  x <- c(na.omit(x))
+  t <- gl_translate(x)
+  t %>%
+    count(detectedSourceLanguage) %>%
+    transmute(N = paste0(detectedSourceLanguage, ": ", n)) %>%
+    pull() %>%
+    glue::glue_collapse(sep = ", ", last = "&") %>%
+    message("Detected languages: ", .)
+  out <- character(length(which_NA))
+  out[!which_NA] <- t %>% pull(translatedText)
+  out[which_NA] <- NA
+  out
+}
+
+language_queries <- c(
+  de = '("Kontakthypothese" OR "Inter* Kontakt" OR Interkultureller Kontakt“) AND ("Arbeit" ODER "Arbeitsplatz") AND ("Vorurteil" OR "Einstellungen")'
+)
+
+for (i in seq_along(language_queries)) {
+  language_results <- get_scholar_results(
+    q = language_queries[1],
+    max_results = 60, serp_key = serp_key
+  ) # Change to greater max_results in production
+
+  language_results <- language_results %>%
+    unnest_wider(publication_info) %>%
+    select(-type) %>%
+    unnest_wider(authors, names_sep = "_", names_repair = "universal") %>%
+    unnest_wider(matches("authors_[0-9]+$"), names_sep = "_", names_repair = "unique") %>% # Unnests all columns matching the term
+    mutate(
+      year = str_extract(summary, "[0-9]{4}"),
+      first_author = str_remove(summary, ",.*$") %>%
+        str_remove("-.*$") %>% str_remove("^[A-Z]* ")
+    ) %>%
+    hoist(resources, resource_link = c(1, 3)) %>%
+    hoist(inline_links, citation_count = c("cited_by", "total"), citation_link = "serpapi_cite_link")
+
+  # Workaround for pmap as list columns cause problems - https://github.com/tidyverse/purrr/issues/846
+  ls_cols <- language_results %>% keep(is.list)
+  other_cols <- language_results %>% keep(~ !(is.list(.x)))
+
+  plan(multisession, workers = 5) # Parallel API requests to crossref
+
+  aug_df <- other_cols %>%
+    showing_progress(function(...) future_pmap_dfr(..., .options = furrr_options(seed = TRUE)), function(...) {
+      df <- extract_crossref(tibble(...))
+      # if ("doi" %in% names(df) && !is.na(df$doi)) df <- get_citation(df)
+      df
+    }, steps = nrow(.)) %>%
+    cbind(ls_cols)
+
+  aug_df$language <- names(language_queries)[1]
+
+
+  aug_df$Ys <- lengths(str_extract_all(aug_df$cr_match, "Y"))
+
+  aug_df[aug_df$Ys == 0, "result"] <- "no_match_delete"
+
+  message("Translating ", names(language_queries)[1], " results")
+
+  aug_df[c("title", "snippet")] <- map_dfr(aug_df[c("title", "snippet")], translate)
+  aug_df[aug_df$Ys != 0, c("abstract", "cr_title")] <- map_dfr(aug_df[aug_df$Ys != 0, c("abstract", "cr_title")], translate)
+
+  save_rds(aug_df, glue::glue("results_aligned/scholar_{names(language_queries)[1]}.RDS"))
+}
+```
+From there:
+
+- run crossref manual merge as per GS and SSRN above
+- do title and snippet screening to decide which abstracts to retrieve
+- retrieve abstracts from links (prob with BeautifulSoup)
+- do full screening

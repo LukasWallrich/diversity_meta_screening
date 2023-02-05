@@ -1,0 +1,447 @@
+---
+title: "Scrape search results"
+output: html_notebook
+---
+
+This workflow was developed and tested with a different search query, namely *("intergroup contact" OR "intergroup friendships" OR "intercultural contact") AND ("work" OR "workplace") AND ("prejudice" OR "attitudes" OR "bias")* 
+
+# Packages used
+
+```{r}
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(reticulate, tidyr, dplyr, jsonlite, purrr, stringr, rcrossref, bib2df, progressr, progress, furrr)
+
+#Enable progress updates
+handlers(global = TRUE)
+handlers(handler_progress(
+    format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+    width    = 60,
+    complete = "="
+  ))
+
+set.seed(1234)
+
+#Import API keys
+source("API_keys.R")
+
+```
+
+# Sources
+
+- EBSCO host: OpenDissertations, Business Source Premier, PsycInfo - run search, then export to XML
+- Google Scholar: scrape with serpapi, augment DOIs and abstracts with rcrossref
+- SSRN: through Google Scholar, with site:ssrn.com
+- Previous reviews: extract references with Scopus API
+
+## Import EBSCO
+
+Import to BibTex would be much simpler, but does not include DOIs - therefore, XML wrangling needed
+
+```{r}
+library(xml2)
+
+ebsco <- as_list(read_xml("EBSCO.xml"))
+
+check_doi <- Vectorize(function(x) {
+  if(length(x) == 0) return("")
+  if (attr(x, "type") == "doi") return(unlist(x))
+  return("")
+}, SIMPLIFY = FALSE)
+
+unlist_NA <- function(x) {
+ map(x, function (y) {if (is.null(y) || length(y) == 0) NA
+    else y}) %>% reduce(c) #Use reduce to retain special types - e.g., dates
+}
+
+
+safe_format <- function(bibtex, doi) {
+  if(length(bibtex) == 0) {
+    purrr::possibly(cr_cn, otherwise = NA)(dois = doi, format = "text", style = "apa")
+  } else {
+    purrr::possibly(format, otherwise = NA)(bibtex, .bibstyle = "brief")
+  }
+}
+
+get_citation <- function(df) {
+   cite <- cr_cn(dois = df$doi, format = "bibtex", style = "apa")
+
+  fileConn<-file(tmp)
+  writeLines(cite, fileConn)
+  close(fileConn)
+  t <- bibtex::read.bib(tmp)
+    df$citation <-  safe_format(t, df$doi)
+    df$bibtex <- cite
+    df
+}
+
+
+apa_style <- tools::bibstyle("brief", sortKeys = function(refs) seq_along(refs),
+    extraInfo = function(paper) NULL,
+    .init = TRUE)
+
+extract_date <- Vectorize(function(x) {
+  lubridate::ymd(paste(attr(x, "year"), attr(x, "month"), attr(x, "day")))
+}, SIMPLIFY = FALSE)
+
+#needed_columns <- c("database", )
+
+ebsco_df <- as_tibble(ebsco) %>% unnest_wider(records)  %>%  rowwise() %>%
+  mutate(database = attr(header, "longDbName")) %>% ungroup() %>% 
+  unnest_wider(header) %>% unnest_wider(controlInfo) %>% 
+  hoist(language, lang = 1) %>% 
+  unnest_wider(artinfo) %>%
+  #Extract DOI - not trivial because other ui included in data
+  mutate(across(starts_with("ui"), check_doi)) %>%
+  unite("ui", str_subset(names(.), "^ui"), sep = "") %>% rename(doi = ui) %>%
+  mutate(abstract = unlist_NA(ab)) %>%
+  hoist(tig, title = list("atl", 1)) %>%
+  #Extract first - most general - pubtype
+  rename(pubtype...0 = pubtype) %>%
+  mutate(pubtype = coalesce(!!!select(., 
+                                   names(.) %>% str_subset("pubtype") %>%
+  {.[match(1:length(.), rank(str_extract_all(., "(\\d)+") %>% unlist() %>% as.numeric()))]}) %>%
+    mutate(across(.fns = unlist_NA)))) %>%
+  hoist(pubinfo, "dt") %>%
+  mutate(date = extract_date(dt) %>% unlist_NA(),
+         year = lubridate::year(date)) %>%
+  hoist(jinfo, pubtitle = "jtl")
+
+```
+
+### Augment results that have DOIs
+
+```{r}
+
+showing_progress <- function(x, fn, fn2, ..., steps = length(x)) {
+   p <- progressr::progressor(steps = steps)
+   p(amount = 0)
+   fn(x, function(...) {
+     p()
+     fn2(...)
+   })
+}
+
+ebsco_df_dois <-  ebsco_df %>% filter(doi != "") %>% 
+  select(doi, abstract, title, pubtype, pubtitle, year) 
+
+plan(multisession, workers = 2) #Parallel API requests - could be more, but let's be friendly
+
+f <- function(x) {
+   p <- progressr::progressor(steps = nrow(x))
+   p(amount = 0)
+   future_pmap_dfr(x, function (...) {
+            df <- get_citation(tibble(...))
+            p()
+            df
+            }, .options = furrr_options(seed = TRUE))
+}
+
+ebsco_df_dois_enh <- ebsco_df_dois[1:10,] %>% showing_progress(future_pmap_dfr, get_citation, steps = nrow(.))
+  
+  
+  f(ebsco_df_dois)  
+  
+try_abstract <- possibly(cr_abstract, NA)
+
+
+
+#Try to pull missing abstracts from crossref (won't add many)
+ebsco_df_dois$abstract[is.na(ebsco_df_dois$abstract)] <- ebsco_df_dois %>% filter(is.na(abstract)) %>% 
+  pull(doi) %>% add_progress(map_chr, try_abstract)
+
+ebsco_df_dois <- ebsco_df_dois %>% mutate()
+
+```
+
+### Deal with results without DOI
+
+```{r}
+
+
+ebsco_df_no_dois <-  ebsco_df %>% filter(doi == "") %>% 
+  #Extract authors (sometimes retains affiliations - best fixed manually in end)
+  rowwise() %>% mutate(authors = paste(unlist(aug), collapse = " | ")) %>%
+  ungroup() %>%  
+  select(doi, authors, year, title, abstract, pubtype, pubtitle)
+
+```
+
+
+# Scrape Google Scholar with serpapi
+
+Use scholarly Python package
+
+```{python}
+
+from serpapi import GoogleSearch
+
+params = {
+  "engine": "google_scholar",
+  "q": '("intergroup contact" OR "intergroup friendships" OR "intercultural contact") AND ("work" OR "workplace") AND ("prejudice" OR "attitudes" OR "bias")',
+  "api_key": "763845b7d9d5ab7b5486803fc923115ad8f99c3fb2f2ff3b1ae5ef554b97d930",
+  "num": 20
+}
+
+all_results = []
+
+for i in range(0, 100, 20): #For production: change 100 to 1000 results
+  params["start"] = i
+  search = GoogleSearch(params)
+  results = search.get_dict()
+  organic_results = results['organic_results']
+  all_results.append(organic_results)
+
+
+
+```
+
+
+```{r}
+all_results = unlist(py$all_results, recursive = FALSE)
+saveRDS(all_results, "scholar_results.RDS") 
+```
+
+
+```{r}
+#readRDS("scholar_results.RDS") -> all_results
+all_results_df <- tibble(scrape = all_results)
+
+
+unnest_authors <- function(df) {
+  #cycle through authors and unnest
+  columns <- df %>% names() %>% keep(safe_str_detect(., "authors_[0-9]$"))
+
+  if (length(columns) == 0) return(df)
+  
+  df <- df %>% unnest_wider(columns[1], names_sep = "_")
+
+  unnest_authors(df)   
+}
+
+all_results_df2 <- all_results_df %>% 
+  unnest_wider(scrape) %>% 
+  unnest_wider(publication_info) %>% 
+  unnest_wider(authors, names_sep = "_", names_repair = "universal") %>%
+  unnest_authors() %>%
+  mutate(year = str_extract(summary, "[0-9]{4}"),
+         first_author = str_remove(summary, ",.*$") %>% 
+           str_remove("-.*$") %>% str_remove("^[A-Z]* "))
+
+  
+
+clean_text <- function(x) {
+  stringr::str_squish(stringr::str_to_lower(iconv(x, to = 'ASCII//TRANSLIT')))
+}
+
+match_crossref <- function(df, crr) {
+  withCallingHandlers(
+    {
+      
+  cr_match <- tibble()
+  comp_res <- c()
+        crr <- crr %>%
+        mutate(across(any_of(c("created", "published.print", "published.online", "issued")),
+          ~ lubridate::year(lubridate::parse_date_time(.x, orders = c("%Y-%m-%d", "%Y"))),
+          .names = "year_{.col}"
+        ))
+
+      if (clean_text(crr$title) == clean_text(df$title) |
+        safe_str_detect(clean_text(crr$title), clean_text(df$title)) ||
+        safe_str_detect(clean_text(df$title), clean_text(crr$title))) {
+        comp_res <- c(comp_res, "t:Y")
+      } else {
+        comp_res <- c(comp_res, "t:N")
+      }
+
+      years <- as.numeric(crr[safe_str_detect(names(crr), "year_")])
+
+      if (df$year %in% years) {
+        comp_res <- c(comp_res, "y:Y")
+      } else {
+        comp_res <- c(comp_res, "y:N")
+      }
+
+      if ("author" %in% names(crr) &&
+        (safe_str_detect(clean_text(df$first_author), clean_text(crr$author[[1]]$family[1]))||
+          safe_str_detect(clean_text(df$authors_1_name), clean_text(crr$author[[1]]$family[1])))) {
+        comp_res <- c(comp_res, "1st:Y")
+              } else {
+        comp_res <- c(comp_res, "1st:N")
+      }
+      df$doi <- crr$doi
+      df$doi_url <- crr$url
+      df$abstract <- crr$abstract
+      df$authors <- crr$author
+      df$journal <- crr$container.title
+      df$type <- crr$type
+      df$cr_match <- str_flatten(comp_res)
+      
+      df
+      
+      },
+    error = function(w) {
+    })
+  }
+
+extract_crossref <- function(df) {
+  withCallingHandlers(
+    {
+      print(paste("\nTrying", df$summary))
+
+      crr <- cr_works(flq = c(query.bibliographic = 
+                                paste(df$title, df$summary)), limit = 1)$data
+
+      if (is.null(crr)) {
+        return(df)
+      }
+
+      df_merged <- match_crossref(df, crr)
+      
+      if(length(str_extract_all(df_merged$cr_match, "Y")[[1]])==3 || 
+         is.na(df$authors_1_name)) return(df_merged)
+        
+      crr2 <- cr_works(flq = c(query.bibliographic = 
+                                paste(df$title, df$authors_1_name, df$year)), limit = 1)$data
+      
+            if(crr2$doi == crr$doi) {
+              if (length(str_extract_all(df_merged$cr_match, "Y")[[1]]) == 2) {
+                return(df_merged)
+              } else {
+                return(df)
+              }
+            }
+        df_merged2 <- match_crossref(df, crr2)
+        
+        if(length(str_extract_all(df_merged2$cr_match, "Y")[[1]])==3) {
+          return(df_merged2)
+        } 
+        
+        if (length(str_extract_all(df_merged$cr_match, "Y")[[1]]) == 2) {
+          if (length(str_extract_all(df_merged2$cr_match, "Y")[[1]]) == 2) {
+          df_merged$notes <- paste(df_merged$notes, "| alt DOI:", df_merged2$doi_url)
+          } 
+            return(df_merged)
+          } else if  (length(str_extract_all(df_merged2$cr_match, "Y")[[1]]) == 2) {
+          return(df_merged2)
+        } else {
+          df
+        }
+
+},
+    warning = function(w) {
+      if (safe_str_detect(conditionMessage(w), "failed to parse") |
+        safe_str_detect(conditionMessage(w), "uninitialised column")) {
+        invokeRestart("muffleWarning")
+      }
+    }
+  )
+}
+
+safe_format <- function(bibtex, doi) {
+  if(length(bibtex) == 0) {
+    purrr::possibly(cr_cn, otherwise = NA)(dois = doi, format = "text", style = "apa")
+  } else {
+    purrr::possibly(format, otherwise = NA)(bibtex, .bibstyle = "brief")
+  }
+}
+
+get_citation <- function(df) {
+   cite <- cr_cn(dois = df$doi, format = "bibtex", style = "apa")
+
+  fileConn<-file(tmp)
+  writeLines(cite, fileConn)
+  close(fileConn)
+  t <- bibtex::read.bib(tmp)
+    df$citation <-  safe_format(t, df$doi)
+    df$bibtex <- cite
+    df
+}
+
+ls_cols <- all_results_df2 %>% keep(is.list)
+other_cols <- all_results_df2 %>% keep(~!(is.list(.x)))
+
+apa_style <- tools::bibstyle("brief", sortKeys = function(refs) seq_along(refs),
+    extraInfo = function(paper) NULL,
+    .init = TRUE)
+
+tmp <- tempfile()
+
+pb <- progress_bar$new(total = nrow(ls_cols),
+                       format = "  matching [:bar] :current/:total (remaining: :eta)")
+
+f <- function() {
+    pb$tick(0)
+    pmap_dfr(other_cols, function(...){
+      df <- extract_crossref(tibble(...))
+      if ("doi" %in% names(df) && !is.na(df$doi)) df <- get_citation(df)
+      pb$tick()
+      df
+    })
+}  
+
+aug_df <- cbind(f(), ls_cols)
+
+saveRDS(aug_df, "scholar_augmented.RDS") 
+
+
+```
+
+## Search SSRN on Google Scholar
+
+TK - check total results before iterating
+
+```{python}
+
+from serpapi import GoogleSearch
+
+params = {
+  "engine": "google_scholar",
+  "q": '("intergroup contact" OR "intergroup friendships" OR "intercultural contact") AND ("work" OR "workplace") AND ("prejudice" OR "attitudes" OR "bias") site:ssrn.com',
+  "api_key": "763845b7d9d5ab7b5486803fc923115ad8f99c3fb2f2ff3b1ae5ef554b97d930",
+  "num": 20
+}
+
+all_results = []
+
+for i in range(0, 100, 20): #For production: change 100 to 1000 results
+  params["start"] = i
+  search = GoogleSearch(params)
+  results = search.get_dict()
+  organic_results = results['organic_results']
+  all_results.append(organic_results)
+
+
+
+```
+
+
+## Query Scopus for references in previous reviews
+
+
+
+```{python}
+
+ previous = ["10.1080/15350770.2020.1753621", ]
+
+ from pybliometrics.scopus import AbstractRetrieval
+ ab = AbstractRetrieval("10. 1016/j.softx.2019.100263", view = "REF", refcount = 200)
+ #ab.title
+ 
+ #Citations module needs special API key/permission
+ 
+ #Current API key: 1c8c675bbd0daeaf88d36848da5471c0
+ 
+ 
+```
+
+
+## Export references
+
+```{r}
+t <- bib2df("sample.bib")
+
+t
+
+```
+
+

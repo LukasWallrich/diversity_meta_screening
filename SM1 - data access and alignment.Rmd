@@ -1,0 +1,669 @@
+---
+title: "Retrieve, enhance and align search results"
+output: html_notebook
+---
+
+This process follows [the registration](https://osf.io/f5qdn) created after this meta-analysis was accepted in principle by the Journal of Business and Psychology.
+
+# Packages used and set-up
+
+```{r}
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(reticulate, tidyr, dplyr, jsonlite, purrr, stringr, rcrossref, bib2df, furrr,
+               shiny, shinythemes, progress, progressr, keys, shinyjs, readr, synthesisr,
+               rvest)
+
+pacman::p_load_gh("gadenbuie/shinyThings")
+
+#Enable progress updates
+#handlers(global = TRUE) <- this needs to be run in the console for now
+ handlers(handler_progress(
+     format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+     width    = 60,
+     complete = "=",
+     clear = FALSE
+   ))
+
+ options(progressr.clear = FALSE)
+
+ 
+#Adds progress bars to map and future_map functions
+showing_progress <- function(x, fn, fn2, ..., steps = length(x)) {
+  if(interactive() && !handlers(global = NA)) stop("To use this function, first run `handlers(global = TRUE)` in the console")
+   p <- progressr::progressor(steps = steps)
+   p(amount = 0)
+   fn(x, function(...) {
+     out <- fn2(...)
+     p()
+     out
+   })
+}
+
+
+set.seed(1234)
+
+#Import
+source("API_keys.R")
+source("crossref_and_related.R") #Functions to retrieve and edit citations
+source("helpers.R") #Helper functions - sometimes simple wrappers to deal safely with NULLs
+
+source_python("get_scrape_functions.py")
+
+```
+
+# Sources
+
+- EBSCO host: OpenDissertations, Business Source Premier, PsycInfo - run search, then export to RIS
+--> OpenDissertations: also save results to HTML to obtain links
+
+- Google Scholar: scrape with serpapi, augment DOIs and abstracts with rcrossref
+- SSRN: through Google Scholar, with site:ssrn.com (ssrn.org does not support Boolean operators), again augment with rcrossref
+- Previous reviews: extract references with Grobid & citations with OpenCitations and Scopus
+- Reference in included empirical articles: extract references with Grobid
+
+## Import EBSCO
+
+```{r import-ebsco, message=FALSE}
+
+ebsco_psy_bs <- read_ref("search_results/EBSCO_psych_and_BS.ris")
+
+ebsco_psy_bs <-  ebsco_psy_bs %>%
+  mutate(doi = coalesce(doi, L3)) %>% 
+  select(database, doi, author = author, title, year = Y1, type = source_type, abstract, journal, volume, issue, start_page, end_page, pubtitle = source) %>% 
+  mutate(year = year %>% str_sub(1, 4) %>% as.numeric(),
+         database = if_else(database == "buh", "BusinessSourcePremier", "PsycINFO"))
+
+write_rds(ebsco_psy_bs, "results_aligned/ebsco_psy_bs.RDS")
+```
+
+## Import OpenDissertations
+
+Here, links are essential but are not exported by EBSCOhost. Therefore, the following process was followed:
+
+- Search on EBSCOhost and export RIS.
+- Change Page Options to show 50 results per page
+- Save page as HTML, then click through pages saving them all (ensure they are numbered so that they are read in the correct order)
+- The helpers/ebsco-to-html folder includes a Google Chrome add-on that supports this process by scrolling down and saving the HTML files (so that the task consists of clicking next ~70 times)
+- First read in RIS file, then add URLs.
+
+```{r}
+
+ebsco_open_diss <- read_ref("search_results/OpenDissertations.ris")
+
+# HTML files
+html_files <- list.files("./search_results/OpenDissertations_html/", 
+                         pattern = "*.html", full.names = TRUE)
+
+urls <- map(html_files, function(html_file) {
+  html_file %>% read_html() %>% 
+  html_elements(css='.display-info') %>% 
+  html_element("a") %>% 
+  html_attr("href")
+}) %>% unlist()
+
+ebsco_open_diss$resource_link <- urls
+
+ebsco_open_diss <- ebsco_open_diss %>% 
+  transmute(
+    database = "OpenDissertations",
+    title,
+    author = author,
+    year,
+    abstract,
+    type = source_type,
+    resource_link
+  )
+
+write_rds(ebsco_open_diss, "results_aligned/ebsco_open_diss.RDS")
+```
+
+# Scrape Google Scholar with serpapi
+
+*Given that Google Scholar will also be used to search SSRN, these hits are excluded here - and then used separately for SSRN*
+
+```{r scrape-scholar}
+scholar_results_1 <- get_scholar_results(
+  q = '(diverse OR diversity OR heterogenous OR heterogeneity OR “team composition” OR “individual differences”) AND (team OR group) AND (performance OR creativity OR productivity OR innovation OR effectiveness) -site:ssrn.com', 
+  max_results = 1000L, serp_key = serp_key, start = 0L) #Reduce max for testing - 1 search charged per 20 results
+
+scholar_results_2 <- get_scholar_results(
+  q = '((diversity AROUND(3)  performance) OR (diversity AROUND(3) creativity) OR (diversity AROUND(3) productivity) OR (diversity AROUND(3) innovation) OR (diversity AROUND(3) effectiveness)) AND (team OR group) -site:ssrn.com', 
+  max_results = 1000L, serp_key = serp_key, start = 0L) 
+
+scholar_results_3 <- get_scholar_results(
+  q = '((“team composition” AROUND(3)  performance) OR (“team composition” AROUND(3) creativity) OR (“team composition” AROUND(3) productivity) OR (“team composition” AROUND(3) innovation) OR (“team composition” AROUND(3) effectiveness))', 
+  max_results = 1000L, serp_key = serp_key, start = 0L) # Cannot exclude SSRN here due to search string length limitations
+
+
+list_if_not <- function(x) {
+  if (!is.list(x)) return(list(x))
+  x
+}
+
+scholar_results <- bind_rows(
+  scholar_results_1 %>% mutate(cite_string = "scholar_query_1", link = list_if_not(link)),
+  scholar_results_2 %>% mutate(cite_string = "scholar_query_2", link = list_if_not(link)),
+  scholar_results_3 %>% mutate(cite_string = "scholar_query_3", link = list_if_not(link))
+)
+
+write_rds(scholar_results, "search_results/scholar_results.RDS")
+```
+
+## Add crossref metadata
+
+```{r}
+
+#read_rds("search_results/scholar_results.RDS") -> scholar_results
+
+scholar_results <- scholar_results %>% 
+  unnest_wider(publication_info) %>% 
+  select(-type) %>%
+  unnest_wider(authors, names_sep = "_", names_repair = "universal") %>%
+  unnest_wider(matches("authors_[0-9]+$"), names_sep = "_", names_repair = "unique") %>% #Unnests all columns matching the term
+  mutate(year = str_extract(summary, "[0-9]{4}"),
+         first_author = str_remove(summary, ",.*$") %>% 
+           str_remove("-.*$") %>% str_remove("^[A-Z]* ")) %>%
+  hoist(resources, resource_link = c(1, 3)) %>% 
+  hoist(inline_links, citation_count = c("cited_by", "total"), citation_link = "serpapi_cite_link")
+
+#Workaround for pmap as list columns cause problems - https://github.com/tidyverse/purrr/issues/846
+ls_cols <- scholar_results %>% keep(is.list)
+other_cols <- scholar_results %>% keep(~!(is.list(.x)))
+
+
+# Augment with crossref data in background job
+job::job(title = "Augment GS crossref", {
+  handlers(global = TRUE) 
+handlers(handler_progress(
+  format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+  width    = 60,
+  complete = "=",
+  clear = FALSE
+))
+  plan(multisession, workers = 5) #Parallel API requests to crossref
+  aug_df <- other_cols %>% showing_progress(function(...) future_pmap_dfr(..., .options = furrr_options(seed = TRUE)), function(...) {
+    pacman::p_load(dplyr, stringr, tidyr, rcrossref)
+    source("crossref_and_related.R") #Functions to retrieve and edit citations
+    source("helpers.R") #Helper functions - sometimes simple wrappers to deal safely with NULLs
+    df <- extract_crossref_try(tibble(...))
+     # if ("doi" %in% names(df) && !is.na(df$doi)) df <- get_citation(df)
+      df}, steps = nrow(.)) %>% 
+    cbind(ls_cols)})
+
+#Try to add abstracts from Scopus - tends to add some over crossref
+aug_df$abstract[!is.na(aug_df$doi) & is.na(aug_df$abstract)] <- aug_df$doi[!is.na(aug_df$doi) & is.na(aug_df$abstract)] %>% na.omit() %>% 
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+write_rds(aug_df, "results_aligned/scholar_augmented.RDS") 
+
+```
+
+
+## Search SSRN on Google Scholar
+
+```{r}
+ssrn_results_1 <- get_scholar_results(
+  q = '(diverse OR diversity OR heterogenous OR heterogeneity OR “team composition” OR “individual differences”) AND (team OR group) AND (performance OR creativity OR productivity OR innovation OR effectiveness) site:ssrn.com', 
+  max_results = 1000L, serp_key = serp_key, start = 0L) 
+
+ssrn_results_2 <- get_scholar_results(
+  q = '((diversity AROUND(3)  performance) OR (diversity AROUND(3) creativity) OR (diversity AROUND(3) productivity) OR (diversity AROUND(3) innovation) OR (diversity AROUND(3) effectiveness)) AND (team OR group) site:ssrn.com', 
+  max_results = 1000L, serp_key = serp_key, start = 0L) 
+
+
+ssrn_results <- bind_rows(
+  ssrn_results_1 %>% mutate(cite_string = "ssrn_query_1"),
+  ssrn_results_2 %>% mutate(cite_string = "ssrn_query_2")
+)
+
+write_rds(ssrn_results, "search_results/ssrn_results.RDS")
+```
+
+### Augment with crossref data
+
+```{r}
+#read_rds("search_results/ssrn_results.RDS") -> ssrn_results
+
+ssrn_results <- ssrn_results %>% 
+  unnest_wider(publication_info) %>% 
+  select(-any_of("type")) %>%
+  unnest_wider(authors, names_sep = "_", names_repair = "universal") %>%
+  unnest_wider(matches("authors_[0-9]+$"), names_sep = "_", names_repair = "unique") %>% #Unnests all columns matching the term
+  mutate(year = str_extract(summary, "[0-9]{4}"),
+         first_author = str_remove(summary, ",.*$") %>% 
+           str_remove("-.*$") %>% str_remove("^[A-Z]* ")) %>%
+  hoist(resources, resource_link = c(1, 3)) %>% 
+  hoist(inline_links, citation_count = c("cited_by", "total"), citation_link = "serpapi_cite_link")
+
+#Workaround for pmap as list columns cause problems - https://github.com/tidyverse/purrr/issues/846
+ls_cols_ssrn <- ssrn_results %>% keep(is.list)
+other_cols_ssrn <- ssrn_results %>% keep(~!(is.list(.x)))
+
+# Augment with crossref data in background job
+job::job(title = "Augment SSRN crossref", {
+  handlers(global = TRUE) 
+handlers(handler_progress(
+  format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+  width    = 60,
+  complete = "=",
+  clear = FALSE
+))
+  plan(multisession, workers = 5) #Parallel API requests to crossref
+  aug_df_ssrn <- other_cols_ssrn %>% showing_progress(function(...) future_pmap_dfr(..., .options = furrr_options(seed = TRUE)), function(...) {
+    pacman::p_load(dplyr, stringr, tidyr, rcrossref)
+    source("crossref_and_related.R") #Functions to retrieve and edit citations
+    source("helpers.R") #Helper functions - sometimes simple wrappers to deal safely with NULLs
+    df <- extract_crossref(tibble(...))
+     # if ("doi" %in% names(df) && !is.na(df$doi)) df <- get_citation(df)
+      df}, steps = nrow(.)) %>% 
+    cbind(ls_cols_ssrn)})
+
+#Try to add abstracts from Scopus - tends to add some over crossref
+aug_df_ssrn$abstract[!is.na(aug_df_ssrn$doi) & is.na(aug_df_ssrn$abstract)] <- 
+  aug_df_ssrn$doi[!is.na(aug_df_ssrn$doi) & is.na(aug_df_ssrn$abstract)] %>% na.omit() %>% 
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+write_rds(aug_df_ssrn, "results_aligned/ssrn_augmented.RDS") 
+```
+
+## Search and scrape NDLTD
+
+This does not offer an API or a bulk export option - could harvest full dataset using [OAI-PMH](https://bepress.com/reference_guide_dc/digital-commons-oai-harvesting/) - possibly starting from this [Ruby script](https://github.com/astromechza/ndltd-scraper-ruby/blob/master/ndltd_downloader.rb), but web-scraping seems slightly more efficient.
+
+High number of results due to apparently very liberal stemming - e.g. effectiveness to effective. Maybe repeat search after download?
+
+```{r}
+base_url <- "http://search.ndltd.org/search.php?q=%28diverse+OR+diversity+OR+heterogenous+OR+heterogeneity+OR+%22team+composition%22+OR+%22individual+differences%22%29+AND+%28team+OR+group%29+AND+%28performance+OR+creativity+OR+productivity+OR+innovation+OR+effectiveness%29&source_set_names=&year_start=&year_end="
+
+total_results <- read_html(base_url) %>% html_elements("small") %>% 
+  html_text() %>% str_subset("Showing 1 to 10") %>% 
+  str_extract("[0-9]*(?= \\()") %>% as.numeric()
+
+job::job(title = "Scrape NDLTD", {
+  handlers(global = TRUE) 
+handlers(handler_progress(
+  format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+  width    = 60,
+  complete = "=",
+  clear = FALSE
+))
+  plan(multisession, workers = 2) #Parallel API requests to crossref
+  ndltd_results <- showing_progress(seq.int(0, total_results, by = 10), future_map, function(start) {
+    pacman::p_load(dplyr, rvest, stringr, purrr)
+    page <- read_html(paste0(base_url, "&start=", start))
+    results <- page %>% html_elements(".search_table_detail_col")
+  
+    titles <- map_chr(results, ~html_element(.x, "h4") %>% html_text())
+    links <- paste0("http://search.ndltd.org/", 
+                    map_chr(results, ~html_element(.x, "h4") %>% html_element("a") %>% html_attr("href")))
+    
+    author_years <- map(results, ~html_elements(.x, "em") %>% html_text()) %>% transpose()
+    
+    abstracts <- page %>% html_elements(".record_description") %>% html_text()
+    
+    tibble::tibble(database = "NDLTD", title = titles,
+           author = author_years[[1]] %>% unlist(),
+           year = author_years[[2]] %>% unlist() %>% str_extract("[0-9]{4}"),
+           abstract = abstracts,
+           type = "thesis_dissertation",
+           resource_link = links)
+  })
+})
+
+
+ndltd_results_df <- ndltd_results %>% bind_rows() %>% 
+  mutate(across(where(is.character), str_trim))
+```
+
+### Sort out abstract languages
+
+Identify abstract language, then extract English abstract if available, and otherwise translate first 500 characters
+
+```{r}
+pacman::p_load_gh("ropensci/cld2")
+
+collapse_short_strings <- function(x, cut_off = 500) {
+  if (sum(str_length(x)) < cut_off) return(x) 
+  merge <- str_length(x) < cut_off
+  if (all(!merge)) return(x)
+  now <- which(merge)[1]
+  y <- x
+  if(now == length(x)) {
+    y[length(x) - 1] <- paste(x[length(x) - c(1,0)], collapse = " \\ ")
+    y <- y[-length(x)]
+  } else if (now == 1) {
+    y[now+1] <- paste(x[now + c(0, 1)], collapse = " \\ ")
+    y <- y[-now]
+  }
+  
+  else {
+    direction <- if_else(str_length(y[now+1])>str_length(y[now-1]), -1, 1)
+    y[now + direction] <- paste(x[sort(now + c(0, direction))], collapse = " \\ ")
+    y <- y[-now]
+  }
+  collapse_short_strings(y, cut_off = cut_off)
+}
+
+
+abstract_language <- function(abstracts) {
+  map(abstracts, function(x) {
+  
+ res <- cld2::detect_language_mixed(x)
+ language <- res$classification$code[res$classification$proportion == max(res$classification$proportion)][1]
+ translate <- TRUE
+ if ("en" %in% res$classification$code && 
+     # When English is either a substantial chunk, or the most frequent language
+     (res$classification$proportion[res$classification$code == "en"] * res$bytes > 1000 ||
+     res$classification$proportion[res$classification$code == "en"] == max(res$classification$proportion))) {
+   translate <- FALSE
+ } 
+ 
+ english_abstract <- x
+ 
+ if (language != "en") {
+   if (str_detect(x, " / ")) {
+     segments <- str_split_1(x, " / ")
+     segments <- collapse_short_strings(segments)
+     segments <- segments[cld2::detect_language(segments) %>% {is.na(.) | . == "en"}]
+     if(length(segments) > 0) english_abstract <- paste(segments, collapse = " / ")
+   }
+ }
+ 
+
+ tibble(language = language, translate = translate, english_abstract = english_abstract)
+  }) %>% bind_rows()
+}
+
+pacman::p_load(googleLanguageR)
+gl_auth("google_translate.json")
+translate <- function(x, drop_tags = TRUE) {
+  if (sum(str_length(x)) > 5000) {
+    if(usethis::ui_nope(glue::glue("Translation of more than {sum(str_length(x))} characters requested. Continue?"))) return(NULL)
+  }
+  if (drop_tags) {
+    x <- str_replace_all(x, "<.*?>", " ")
+  }
+  which_NA <- is.na(x)
+  x <- c(na.omit(x))
+  t <- gl_translate(x)
+  t %>%
+    count(detectedSourceLanguage) %>%
+    transmute(N = paste0(detectedSourceLanguage, ": ", n)) %>%
+    pull() %>%
+    glue::glue_collapse(sep = ", ", last = "&") %>%
+    message("Detected languages: ", .)
+  out <- character(length(which_NA))
+  out[!which_NA] <- t %>% pull(translatedText)
+  out[which_NA] <- NA
+  out
+}
+
+ndltd_results_df <- ndltd_results_df %>% mutate(abstract_language(abstract))
+
+translate_abstract_if <- function(abstract, translate, n_char = 500) {
+  res <- abstract
+  res[translate] <- paste(translate(str_sub(abstract[translate], 1, n_char)), str_sub(abstract[translate], n_char + 1))
+  res
+}
+
+ndltd_results_df <- ndltd_results_df %>% 
+  mutate(translate = if_else(str_length(abstract) < 100, FALSE, translate), # Fewer 100 char indicates that abstract is missing
+         translate_narrow = if_else(cld2::detect_language(english_abstract) %>% {!is.na(.) & . == "en"}, FALSE, translate)) %>%
+  mutate(english_abstract = translate_abstract_if(english_abstract, translate_narrow, 500))
+
+ndltd_results_df %>% write_rds("search_results/ndltd_results.RDS")
+
+ndltd_results_df <- read_rds("search_results/ndltd_results.RDS")
+
+ndltd_results_df %>% bind_rows() %>% write_rds("results_aligned/ndltd_results.RDS")
+
+```
+
+
+## Query Scopus for references in previous reviews
+
+Remember: need to be in university network / VPN to access Scopus API
+
+```{r}
+previous <- c(
+  bell_2011 = "10.1177/0149206310365001",
+  bowers_2000 = "10.1177/104649640003100303",
+  bui_2019 = "10.1111/apps.12203",
+  horwitz_2007 = "10.1177/0149206307308587",
+  huelsheger_2009 = "10.1037/a0015978",
+  # joshi_2009 = , no DOI, but have PDF
+  peeters_2006 = "10.1002/per.588",
+  stahl_2010 = "10.1057/jibs.2009.85",
+  van_dijk_2012 = "10.1016/j.obhdp.2012.06.003",
+  webber_2001 = "10.1016/S0149-2063(00)00093-3",
+  wei_2015 = "10.3724/SP.J.1041.2015.01172",
+  bunderson_2018 = "10.1146/annurev-orgpsych-032117-104500",
+  sulik_2021 = "10.1177/17456916211006070",
+  # williams_1998 = , - PDF without OCR, so maybe needs to be done manually
+  yadav_2020 = "10.1108/EDI-07-2019-0197"
+)
+
+#Beware: this function cannot cache results - so don't call repeatedly with same dois.
+#Sometimes returns inconsistent types - so cannot use map_dfr directly
+scopus_refs <- previous %>% showing_progress(map, get_scopus_references)
+
+scopus_refs_df <- bind_rows_to_list(!!! scopus_refs, .id = "cited_in")
+
+scopus_refs_df <- scopus_refs_df %>% 
+  mutate(across(where(is.list), unlist_w_NULLs)) %>% 
+  transmute(
+    database = "previous_reviews",
+    cited_in,
+    doi,
+    scopus_id = id,
+    title,
+    author = authors,
+    volume,
+    issue,
+    year = str_sub(coverDate, 1, 4) %>% na_if("NULL"),
+    start_page = first,
+    end_page = last,
+    pubtitle = sourcetitle,
+    pubtype = if_else(str_detect(pubtitle, fixed("journal", ignore_case=TRUE)), "journal-article", NA_character_),
+    citation_count = citedbycount,
+    in_scopus = type == "resolvedReference"
+  )
+
+# Add abstracts
+
+## Cannot easily be parralelised (reticulate and future are not compatible),
+## but Scopus API is fast
+scopus_refs_df$abstract[!is.na(scopus_refs_df$doi)] <- scopus_refs_df$doi %>% na.omit() %>% 
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+## Try scopus id for hits listed in scopus (not just resolved from PDF), but without DOI
+scopus_refs_df$abstract[is.na(scopus_refs_df$doi) & scopus_refs_df$in_scopus] <- 
+  scopus_refs_df$scopus_id[is.na(scopus_refs_df$doi) & scopus_refs_df$in_scopus]  %>% 
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x, id_type = "scopus_id") %>% {get_longer(.[[1]], .[[2]])}})
+
+## Try crossref for remaining DOIs
+scopus_refs_df$abstract[!is.na(scopus_refs_df$doi) & is.na(scopus_refs_df$abstract)] <- 
+  scopus_refs_df$doi[!is.na(scopus_refs_df$doi) & is.na(scopus_refs_df$abstract)] %>% 
+  showing_progress(map, possibly(cr_abstract, ""))
+
+
+write_rds(scopus_refs_df, "results_aligned/scopus_previous.RDS")
+
+
+```
+
+## Extract citations from PDFs directly
+
+The above only works for sources indexed in Scopus. For others, GROBID is used to extract references from PDFs - usually, this should be done with a local installation, but that is currently difficult on Macs with M2 and without a Crossref subscription - so we use the web service which appears acceptable for the kind of load expected here. (https://github.com/kermitt2/grobid_client_python/issues/54#issuecomment-1272509755). This makes it rather slow ... approx. 1 min per PDF.
+
+Note that this does not recognise text in PDF scans - these need to be OCR-ed before.
+
+```{r}
+pacman::p_load(sys)
+
+fs <- list.files("./past_review_PDFs", pattern = ".pdf", full.names = TRUE)
+
+# OCR them (this also compresses the ones already containing text, if that takes 
+# too long, could also first try GROBID and only OCR failures
+showing_progress(fs, walk, \(x) normalizePath(x) %>% {system(glue::glue('ocrmypdf --skip-text "{.}" "{.}"'))})
+
+#OCR the Chinese doc again with eng + chi_sim
+system(glue::glue("ocrmypdf -l eng+chi_sim --redo-ocr '{fs[2]}' '{fs[2]}'"))
+
+
+# Request from GROBID
+refs <- showing_progress(fs, map, \(f) {
+  f_bib <- paste0(tools::file_path_sans_ext(f), ".bib")
+  if (!file.exists(f_bib)) {
+    bib <- parse_pdf_refs(f)
+    writeLines(bib, f_bib)
+  } else {
+    message("Skipping retrieval for ", basename(f), ". Instead, reading references from .bib file")
+    bib <- read_lines(f_bib)
+  }
+  if (length(bib) == 0 || (length(bib) == 1 && bib[1] == "")) {
+    message("No references found for ", f)
+    return(data.frame())
+  }
+  
+  res <- bib2df::bib2df(f_bib) %>% 
+    collapse_to_string(where(is.list)) 
+  res$database <- paste0("references_", basename(f))
+  res
+}) %>% set_names(fs)
+
+refs <- bind_rows(refs) %>% rename_with(tolower)
+
+refs$abstract <- NA
+
+refs$abstract[!is.na(refs$doi)] <- refs$doi %>% na.omit() %>% 
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+pdf_refs <- refs %>% 
+  mutate(pages = str_replace(pages, "--", "-")) %>% 
+  transmute(
+    database,
+    doi,
+    title,
+    author = author,
+    volume,
+    issue = number,
+    year,
+    start_page = str_extract(pages, ".*(?=\\-)"),
+    end_page = str_extract(pages, "(?<=\\-{1,2})\\d+"),
+    journal = journal,
+    pubtitle = booktitle,
+    pubtype = type,
+    publisher = publisher,
+    abstract = abstract
+  ) 
+
+saveRDS(pdf_refs, "results_aligned/grobid_refs.RDS")
+```
+
+### Repeat for included articles
+
+## Query citations of meta-analyses (forward chasing)
+
+Combine Scopus and OpenCitations - in spite of claims that latter has [similar coverage](https://opencitations.wordpress.com/2021/10/27/coverage-of-open-citation-data-approaches-parity-with-web-of-science-and-scopus/), on some test items there were ~33% more Scopus citations. Google Scholar would be more comprehensive - but much harder to deduplicate without DOIs and with fragmentary abstracts.
+
+Note that the Scopus API access to citations is disabled by default - it needs to be enabled by their customer support on a case-by-case basis.
+
+```{r}
+pacman::p_load(citecorp)
+
+previous_metas <- c(
+  bell_2011 = "10.1177/0149206310365001",
+  bowers_2000 = "10.1177/104649640003100303",
+  bui_2019 = "10.1111/apps.12203",
+  horwitz_2007 = "10.1177/0149206307308587",
+  huelsheger_2009 = "10.1037/a0015978",
+  joshi_2009 = "10.5465/amj.2009.41331491",
+  peeters_2006 = "10.1002/per.588",
+  stahl_2010 = "10.1057/jibs.2009.85",
+  van_dijk_2012 = "10.1016/j.obhdp.2012.06.003",
+  webber_2001 = "10.1016/S0149-2063(00)00093-3",
+  wei_2015 = "10.3724/SP.J.1041.2015.01172"
+)
+
+  plan(multisession, workers = 5) #Parallel API requests to crossref
+
+open_citations <- oc_coci_cites(previous_metas) %>% split(.$cited) 
+
+# Request citations in batches - otherwise fails with "header to large" request
+open_citations_aug <- open_citations %>% 
+  showing_progress(function(...) future_map_dfr(..., .id = "cited", .options = furrr_options(seed = TRUE)), function(df) {
+    tryCatch({
+      step_size <- 100
+      map(seq(1, nrow(df), step_size), function(i) {
+        df$citing[i:min(nrow(df), i+step_size-1)] %>% oc_coci_meta()
+      }) %>% bind_rows()
+    }, error = function(cond) {
+      message("Error occured for ", df$cited[1])
+      message("Original message was: ")
+      message(cond)
+      return(data.frame())
+    })
+    })
+
+open_citations_aug$abstract <- open_citations_aug$doi %>% showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+open_citations_aug <- open_citations_aug %>%
+  transmute(database = "OpenCitations_previous",
+            cited_in = cited,
+         doi = doi,
+         author = author,
+         year = year,
+         title = title,
+         abstract = abstract,
+         start_page = str_extract(page, ".*(?=\\-)"),
+         end_page = str_extract(page, "(?<=\\-{1,2})\\d+"),
+         pubtitle = source_title,
+         resource_link = oa_link,
+         citation_count = citation_count,
+         issue,
+         volume
+         ) %>% tibble()
+
+write_rds(open_citations_aug, "results_aligned/open_citations_df.RDS")
+```
+
+
+```{r}
+scopus_citations <- showing_progress(previous_metas, map, get_scopus_citing_works) %>%
+  set_names(previous_metas) %>% 
+  map2(names(.), ~.x %>% mutate(across(where(is.list), unlist_w_NULLs), cited_in = .y)) %>%
+  bind_rows()
+
+# Not scraping abstracts here since they will largely overlap with OpenCitations
+# scopus_citations$abstract[!is.na(scopus_citations$doi)] <- scopus_citations$doi[!is.na(scopus_citations$doi)] %>% showing_progress(map_chr, function(x) {
+#  get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+scopus_citations <- scopus_citations %>%
+  transmute(database = "ScopusCitations_previous",
+            cited_in,
+            scopus_id = eid,
+         doi = doi,
+         author = author_names,
+         year = coverDate %>% str_sub(1, 4) %>% as.numeric(),
+         title = title,
+         abstract = NA_character_,
+         pubtype = subtypeDescription,
+         pubtitle = publicationName,
+         volume,
+         issue = issueIdentifier,
+         start_page = str_extract(pageRange, ".*(?=\\-)"),
+         end_page = str_extract(pageRange, "(?<=\\-{1,2})\\d+"),
+         citation_count = citedby_count,
+         oa_type = freetoreadLabel
+         ) %>% tibble()
+
+write_rds(scopus_citations, "results_aligned/scopus_citations_df.RDS")
+```
+

@@ -1,0 +1,11 @@
+*.Rds
+*.RDS
+*.Rhistory
+*API_keys.R
+*.pdf
+/archive/*
+*.json
+.Rproj.user
+search_results
+results_*
+past_review_PDFs
