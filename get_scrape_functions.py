@@ -44,7 +44,7 @@ def get_scopus_citing_works(ui, id_type="doi", start = 1700):
 ####Create this to test API access####
 
 
-def get_scholar_results(q, max_results, serp_key, start = 0):
+def get_scholar_results(q, max_results, serp_key, start = 0, lang = None):
   from serpapi import GoogleSearch
   
   params = {
@@ -55,6 +55,10 @@ def get_scholar_results(q, max_results, serp_key, start = 0):
  #   "as_vis": 1,
     "start": start
   }
+  
+  if lang is not None:
+    params["lr"] = "lang_" + lang
+  
   # as_vis can exclude 'citations' - are of very little use without links or details
   
   max_results = int(max_results)

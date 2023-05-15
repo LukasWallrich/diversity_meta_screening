@@ -44,6 +44,17 @@ bind_rows_to_chr <- function(...){
   bind_rows(dfs)
 }
 
+# Needs to be recursive to remove all sets of two repeated different whitespaces
+str_squish_mild <- function(string) {
+  out <- str_replace_all(string, "(\\s)+ (\\s)+", "\\1\\2") %>%
+  str_replace_all("(\\s)(\\s)(\\1\\2)+", "\\1\\2") %>%
+    str_replace_all("(\\s)\\1+", "\\1") %>% str_trim()
+  comp <- out == string
+  comp[is.na(comp)] <- TRUE
+  if (all(comp)) return(out)
+  str_squish_mild(out)
+}
+
 unlist_w_NULLs <- function(x) {
   x[map_lgl(x, is.null)] <- NA
   if (any(lengths(x) > 1)) warning("Some list elements had lengths > 1. Beware if using this in a dataframe.")
@@ -107,5 +118,58 @@ collapse_to_string <- function(.data, ..., .sep = ", ") {
         return(.vec)
       })
     })
+}
+
+
+
+collapse_short_strings <- function(x, cut_off = 500) {
+  if (sum(str_length(x)) < cut_off) return(x)
+  merge <- str_length(x) < cut_off
+  if (all(!merge)) return(x)
+  now <- which(merge)[1]
+  y <- x
+  if(now == length(x)) {
+    y[length(x) - 1] <- paste(x[length(x) - c(1,0)], collapse = " \\ ")
+    y <- y[-length(x)]
+  } else if (now == 1) {
+    y[now+1] <- paste(x[now + c(0, 1)], collapse = " \\ ")
+    y <- y[-now]
+  }
+
+  else {
+    direction <- if_else(str_length(y[now+1])>str_length(y[now-1]), -1, 1)
+    y[now + direction] <- paste(x[sort(now + c(0, direction))], collapse = " \\ ")
+    y <- y[-now]
+  }
+  collapse_short_strings(y, cut_off = cut_off)
+}
+
+extract_english <- function(text, sep = "\n", fall_back_dots = TRUE, detect_english_label = TRUE, cut_off = 50) {
+  if (is.na(text)) return(NA)
+    if (detect_english_label) {
+    if (str_count(text, "English") == 1) {
+      segments <- str_split_1(text, "English")
+      extract_english(segments[2], sep = sep, detect_english_label = FALSE)
+    }
+  }
+  res <- cld2::detect_language_mixed(text)
+
+  if(!"en" %in% res$classification$code) {
+    return(NA)
+  } else if (res$classification$proportion[res$classification$code == "en"] > .9) {
+    return(text)
+  }
+  if (str_count(text, sep) == 0 && fall_back_dots == TRUE) {
+    segments <- str_split_1(text, boundary("sentence"))
+    sep <- ""
+  } else {
+    segments <- str_split_1(text, sep)
+  }
+
+  segments <- collapse_short_strings(segments, cut_off)
+  segments <- segments[cld2::detect_language(segments) %>% {is.na(.) | . == "en"}]
+  if (length(segments) > 0) segments <- paste(segments, collapse = sep)
+  if (length(segments) == 0) return(NA)
+  segments
 }
 

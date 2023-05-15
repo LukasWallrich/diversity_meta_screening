@@ -75,7 +75,8 @@ match_crossref <- function(df, crr) {
 
   years <- as.numeric(crr[safe_str_detect(names(crr), "year_")])
 
-  if (df$year %in% years) {
+  # Allow for +/- 1 year, nearly always just difference between online first and print
+  if (df$year %in% c(years, years + 1, years - 1)) {
     comp_res <- c(comp_res, "year: Y")
   } else {
     comp_res <- c(comp_res, "year: N")
@@ -108,36 +109,39 @@ match_crossref <- function(df, crr) {
 ### trying both title, author year and summary queries
 
 extract_crossref <- function(df) {
-  #print(paste("\nTrying", df$summary))
+
   crr <- cr_works(flq = c(query.bibliographic =
                             paste(df$title, df$summary)), limit = 1)$data
 
-  if (is.null(crr)) {
-    return(df)
-  }
+  if (!is.null(crr) && "title" %in% colnames(crr)) {
+
 
   df_merged <- match_crossref(df, crr)
 
   if(length(str_extract_all(df_merged$cr_match, "Y")[[1]])==3 ||
      is.na(df$authors_1_name)) return(df_merged)
 
+  }
+
+
   crr2 <- cr_works(flq = c(query.bibliographic =
                              paste(df$title, df$authors_1_name, df$year)), limit = 1)$data
 
-  if(crr2$doi == crr$doi) {
-    if (length(str_extract_all(df_merged$cr_match, "Y")[[1]]) == 2) {
+  if (is.null(crr2) || !"title" %in% colnames(crr2) || crr2$doi == crr$doi) {
+    if (exists("df_merged") && length(str_extract_all(df_merged$cr_match, "Y")[[1]]) == 2) {
       return(df_merged)
     } else {
       return(df)
     }
   }
+
   df_merged2 <- match_crossref(df, crr2)
 
   if(length(str_extract_all(df_merged2$cr_match, "Y")[[1]])==3) {
     return(df_merged2)
   }
 
-  if (length(str_extract_all(df_merged$cr_match, "Y")[[1]]) == 2) {
+  if (exists("df_merged") && length(str_extract_all(df_merged$cr_match, "Y")[[1]]) == 2) {
     if (length(str_extract_all(df_merged2$cr_match, "Y")[[1]]) == 2) {
       df_merged$notes <- paste(df_merged$notes, "| alt DOI:", df_merged2$doi_url)
     }

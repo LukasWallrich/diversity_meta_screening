@@ -1,0 +1,137 @@
+---
+title: "Use ChatGPT to extract data from academic abstracts"
+output: html_notebook
+---
+
+ChatGPT is used to extract information from the abstracts - obviously, not to replace human coding but solely to accelerate the process by providing suggestions for some fields that can be tedious to type (e.g., country).
+
+# Code abstracts
+
+Cost ~2 USD for 1800 abstracts.
+
+```{r}
+library(openai)
+library(tidyverse)
+
+abstracts <- included_aug %>% mutate(ID = coalesce(doi, duplicate_id)) %>% filter(!is.na(abstract)) %>% mutate(abstract = paste(title, abstract)) %>% select(ID, abstract)
+abstracts <- abstracts %>% mutate(length = str_length(abstract))
+
+insistent_request <- possibly(insistently(create_chat_completion), otherwise = list(), quiet = FALSE)
+
+p <- progress_estimated(nrow(abstracts))
+
+resp <- list()
+
+for (i in 1:nrow(abstracts)) {
+  
+  current_resp <- 
+            insistent_request(
+    model = "gpt-3.5-turbo",
+     messages = list(
+        list(
+            "role" = "system",
+            "content" = "You are focused on not providing any inaccurate answer"
+        ),
+        list(
+            "role" = "user",
+            "content" = paste(
+            "Fill in the following template based on information in the abstract. Where you are not sure, put NA. Do not return anything else.
+
+Quantitative empirical research: yes/no
+Year collected: xx (e.g., 2000)
+Country:  xx (e.g., Germany)
+Diversity domain: xx (demographic/cognitive/job-related)
+Diversity type: xx (e.g., ethnic diversity)
+Performance type: xx (e.g., creativity)
+Number of teams sampled: xx (e.g., 100)
+Number of individuals: xx
+Student sample: yes/no
+",
+abstracts$abstract[i]
+        )
+    )))
+  resp[abstracts$ID[i]] <- list(current_resp)
+  p$tick()$print()
+  }
+
+
+
+
+
+```
+
+```{r}
+resp <- qs::qread("chatgpt_out.qs")
+
+resp_df <- map_dfr(resp, ~tibble(message = .x$choices$message.content), .id = "ID")
+
+resp_df <- resp_df %>% mutate(message = str_replace_all(message, "\n\n", "\n")) %>% separate_wider_delim(message, "\n", names = c("quant", "year", "country", "div_domain", "div_type", "performance", "N_team", "N_ind", "students"), too_few = "align_start", too_many = "drop") %>% 
+  mutate(across(everything(), str_squish)) 
+
+# Now use count() interactively on each column to identify answer choices - then mutate to clean them up
+resp_df <- resp_df %>% 
+  mutate(
+    quant = case_when(
+      str_detect(quant, regex("yes", ignore_case = TRUE)) ~ "yes",
+      # Exclude not - e.g., not detected
+      str_detect(quant, regex("no(?!t)", ignore_case = TRUE)) ~ "no",
+      .default = NA),
+    year = str_remove(year, "Year collected: ") %>% str_replace( ".*etween (\\d+) and (\\d+)", "\\1-\\2") %>% 
+      timesaveR::na_when(str_detect(., "NA|N/A|not|Not|presumably|unk|unc")) %>% str_remove("between ") %>% na_if(""),
+    country = country %>% 
+           str_remove("Country: ") %>% 
+           timesaveR::na_when(str_detect(., "NA|not |Not")) %>% 
+           str_replace_all(" and ", "; "),
+    div_domain = str_remove(div_domain, "Diversity domain: ") %>% 
+           timesaveR::na_when(str_detect(., "NA|not |Not |N/A")) %>% 
+           str_to_lower() %>% 
+            str_extract_all("(cognitive|demographic|job-related)") %>% map_chr(~paste("", glue::glue_collapse(unique(.x), sep = "; "))) %>% 
+           timesaveR::na_ifs(c(" ", " NA")) %>% str_trim(),
+    div_type = str_remove(div_type, "Diversity type: ") %>% 
+                      timesaveR::na_when(str_detect(., "NA|not |Not |N/A")) %>% 
+           str_remove_all(regex("diversity|TMT|Top management team", ignore_case= TRUE)) %>% 
+           
+           str_remove_all("\\(\\)") %>% str_squish() %>% 
+           na_if(""),
+    performance =  str_remove(performance, "Performance type: ") %>% na_if("NA"),
+    N_team =  str_remove(N_team, "Number of teams sampled: ") %>% 
+                      timesaveR::na_when(str_detect(., "NA|not |Not |N/A"), str_count(., "\\d") == 0),
+    N_ind =  str_remove(N_ind, "Number of individuals: ") %>% 
+                      timesaveR::na_when(str_detect(., "NA|not |Not |N/A|Unknown"), str_count(., "\\d") == 0),
+    students = str_remove(students, "Student sample: ") %>% 
+           timesaveR::na_when(str_detect(., "NA|not |Not |N/A|Uncl")) %>% 
+           str_replace("Yes", "yes") %>% 
+           str_replace("No", "no") %>% 
+           str_remove(fixed("."))
+  ) %>% 
+  rowwise() %>% 
+  mutate(year = if(!is.na(year) & str_detect(year, "^\\d{4}-\\d{4}$"))  {
+    paste0(median(as.numeric(strsplit(year, "-")[[1]])), " [", year, "]")
+  } else {
+    year
+    },
+  country = if(!is.na(country) & sum(str_detect(country, regex(countrycode::codelist$country.name.en.regex, ignore_case = TRUE))) == 1) {
+      countrycode::codelist$country.name.en[str_detect(country, regex(countrycode::codelist$country.name.en.regex, ignore_case = TRUE))]
+    } else {
+      country
+    }) %>% 
+  ungroup() %>% 
+  rename(collection_year = year)
+
+resp_df %>% qs::qsave("chatgpt_out_df.qs")
+
+
+glimpse(resp_df)
+
+```
+
+# Review proposed exclusions
+
+Review entries that ChatGPT flagged as not quantitative empirical and manually exclude where categorisation is correct - usually right, turned out to be review chapters including quantitative statements.
+
+```{r}
+
+included_aug %>% mutate(ID = coalesce(doi, duplicate_id)) %>% left_join(resp_df) %>% filter(quant == "no", is.na(retrieved) | retrieved == "pdf_downloaded_victoria") %>% select(ID, title, abstract) %>% pull(ID)
+
+```
+

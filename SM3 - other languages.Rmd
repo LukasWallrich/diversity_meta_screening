@@ -58,43 +58,111 @@ library(magrittr)
 
 ### Run Google Scholar search per language
 
-For instance in German:
-
-("Kontakthypothese" OR "Inter* Kontakt" OR Interkultureller Kontakt“) AND ("Arbeit" ODER "Arbeitsplatz") AND ("Vorurteil" OR "Einstellungen")
-
-```{r}
-pacman::p_load(googleLanguageR)
-gl_auth("google_translate.json")
-translate <- function(x, drop_tags = TRUE) {
-  if (drop_tags) {
-    x <- str_replace_all(x, "<.*?>", " ")
-  }
-  which_NA <- is.na(x)
-  x <- c(na.omit(x))
-  t <- gl_translate(x)
-  t %>%
-    count(detectedSourceLanguage) %>%
-    transmute(N = paste0(detectedSourceLanguage, ": ", n)) %>%
-    pull() %>%
-    glue::glue_collapse(sep = ", ", last = "&") %>%
-    message("Detected languages: ", .)
-  out <- character(length(which_NA))
-  out[!which_NA] <- t %>% pull(translatedText)
-  out[which_NA] <- NA
-  out
-}
-
-language_queries <- c(
-  de = '("Kontakthypothese" OR "Inter* Kontakt" OR Interkultureller Kontakt“) AND ("Arbeit" ODER "Arbeitsplatz") AND ("Vorurteil" OR "Einstellungen")'
+```{r search_strings}
+single_strings <- c(
+  german = '(Diversity OR Diversität OR heterogen OR Heterogenität OR Teamzusammensetzung OR "individuelle Unterschiede") (Team OR Gruppe) (Leistung OR Kreativität OR Produktivität OR Innovation OR Effektivität)',
+  chinese = '(多种的 OR 多样性 OR 异构性 OR 异构的 OR 团队构成 OR 个体差异) (团队 OR 小组) (表现 OR 绩效 OR 创造力 OR 生产力 OR 绩效 OR 创新)',
+  spanish = '(diverso OR diversidad OR heterogéneo OR heterogeneidad OR "composición del equipo" OR "diferencias individuales") AND (equipo OR grupo) AND (desempeño OR creatividad OR productividad OR innovación OR eficacia)',
+  italian = '(diverso OR diversità OR eterogeno OR "composizione del team" OR "differenze individuali") AND (team OR gruppo) AND (prestazione OR creatività OR produttività OR innovazione)',
+  polish = '(różnorodny OR różnorodność OR niejednolitość OR niejednolity OR "skład zespołu" OR "różnice indywidualne") AND (zespół OR grupa) AND (wydajność OR kreatywność OR produktywność OR innowacja)',
+  japanese = '(多様性 OR  異質 OR "チーム構成" OR個人差) AND (チーム OR 集団) AND ("パフォーマンス" OR創造性 OR生産性 OR 技術革新 OR 有用性)',
+  korean = '(다양성 OR 이질성 OR 팀의구성) AND (팀 OR그룹) AND (성과 OR 팀수행에미 OR창의성 OR 생산성 OR 혁신 OR 효과성)',
+  portuguese = '(diversificado OR diversidade OR heterogeneo OR heterogeneidade OR "composição da equipa" OR "diferenças individuais") AND (equipa OR grupo) AND (desempenho OR criatividade OR produtividade OR inovação OR eficácia)',
+  french = '(divers OR diversité OR hétérogène OR hétérogénéité OR "composition d\'équipe" OR "différences individuelles") AND (équipe OR groupe) AND (performance OR créativité OR productivité OR innovation OR efficacité)',
+  indonesian = '(keragaman OR keanekaragaman OR heterogen OR "komposisi tim" OR "perbedaan individu") AND (tim OR regu) AND (kinerja OR prestasi OR kreativitas OR produktivitas OR inovasi OR keefektifan)'
 )
 
-for (i in seq_along(language_queries)) {
-  language_results <- get_scholar_results(
-    q = language_queries[1],
-    max_results = 60, serp_key = serp_key
-  ) # Change to greater max_results in production
+single_strings_lang <- c(
+  german = 'de',
+  chinese = 'zh-cn',
+  spanish = 'es',
+  italian = 'it',
+  polish = 'pl',
+  japanese = 'ja',
+  korean = 'ko',
+  portuguese = 'pt',
+  french = 'fr',
+  indonesian = 'id'
+)
 
-  language_results <- language_results %>%
+multiple_strings <- list(
+  ukrainian = c(
+    '(різноманітністю OR гетерогенність OR неоднорідність) AND (команда OR група) AND (продуктивність OR креативність OR продуктивність)',
+    '(різноманітністю OR гетерогенність OR неоднорідність) AND (команда OR група) AND (інноваційність OR ефективність)',
+    '("склад команди" OR "індивідуальні відмінності" OR diversity) AND (команда OR група) AND (продуктивність OR креативність OR продуктивність)',
+    '("склад команди" OR "індивідуальні відмінності" OR diversity) AND (команда OR група) AND (інноваційність OR ефективність)'
+  ),
+  russian = c(
+    '(разнообразная OR diversity OR неоднородная OR неоднородность OR "состав команды") AND (команда OR группа) AND (производительность OR инновация)',
+    '(разнообразная OR diversity OR неоднородная OR неоднородность OR "состав команды") AND (команда OR группа) AND (творчество OR креативность)',
+    '(разнообразная OR diversity OR неоднородная OR неоднородность OR "состав команды") AND (команда OR группа) AND (инновации OR эффективность)',
+    '(разнообразная OR diversity OR неоднородная OR неоднородность OR "состав команды") AND (команда OR группа) AND (продуктивность OR результативность)',
+    '(разнообразие OR "индивидуальные различия" OR "индивидуальные особенности") AND (команда OR группа) AND (производительность OR инновация)',
+    '(разнообразие OR "индивидуальные различия" OR "индивидуальные особенности") AND (команда OR группа) AND (творчество OR креативность)',
+    '(разнообразие OR "индивидуальные различия" OR "индивидуальные особенности") AND (команда OR группа) AND (инновации OR эффективность)',
+    '(разнообразие OR "индивидуальные различия" OR "индивидуальные особенности") AND (команда OR группа) AND (продуктивность OR результативность)'
+  )
+)
+
+
+multiple_strings_lang <- c(
+  russian = 'ru',
+  ukrainian = 'uk'
+)
+```
+
+#### Retrieve results
+
+```{r}
+
+language_results <- map2(single_strings, single_strings_lang, \(search_string, lang) {
+  language_results <- get_scholar_results(
+    q = search_string,
+    max_results = 1000, serp_key = serp_key,
+    lang = lang
+  )
+})
+
+language_results_russian <- map(multiple_strings$russian, \(search_string) {
+  language_results <- get_scholar_results(
+    q = search_string,
+    max_results = 1.2 * 1000/length(multiple_strings$russian), # 20% extra for duplication between search strings
+    serp_key = serp_key,
+    lang = multiple_strings_lang["russian"]
+  )
+})
+
+language_results_russian_df <- language_results_russian %>% 
+  bind_rows_to_list(!!!.) %>% 
+  mutate(language = "russian") %>% 
+  group_by(result_id) %>% 
+  slice_head(n = 1) %>% 
+  ungroup()
+
+language_results_ukrainian <- map(multiple_strings$ukrainian, \(search_string) {
+  language_results <- get_scholar_results(
+    q = search_string,
+    max_results = 1.1 * 1000/length(multiple_strings$ukrainian),   # 10% extra for duplication between search strings
+    serp_key = serp_key,
+    lang = multiple_strings_lang["ukrainian"]
+  )
+})
+
+language_results_ukrainian_df <- language_results_ukrainian %>% 
+  bind_rows_to_list(!!!.) %>% 
+  mutate(language = "ukrainian") %>% 
+  group_by(result_id) %>% 
+  slice_head(n = 1) %>% 
+  ungroup()
+
+# For single-string languages
+language_results_df <- language_results %>% bind_rows_to_list(!!!., .id = "language")
+
+# For UKR/RU
+
+language_results_df <- bind_rows(language_results_russian_df, language_results_ukrainian_df)
+
+  language_results_df <- language_results_df %>%
     unnest_wider(publication_info) %>%
     select(-type) %>%
     unnest_wider(authors, names_sep = "_", names_repair = "universal") %>%
@@ -107,38 +175,507 @@ for (i in seq_along(language_queries)) {
     hoist(resources, resource_link = c(1, 3)) %>%
     hoist(inline_links, citation_count = c("cited_by", "total"), citation_link = "serpapi_cite_link")
 
-  # Workaround for pmap as list columns cause problems - https://github.com/tidyverse/purrr/issues/846
-  ls_cols <- language_results %>% keep(is.list)
-  other_cols <- language_results %>% keep(~ !(is.list(.x)))
+  extract_authors_from_summary <- function(summary) {
+    map(summary, ~{
+      out <-
+     .x %>% word(sep = " - ") %>% str_split_1(", ") %>% as.list() %>% 
+      set_names(paste0("authors_", seq_len(length(.)), "_name")) %>% 
+      data.frame()
+      if (nrow(out) != 1) browser()
+      out
+    }) %>% bind_rows()
+  }
+  
+  # Add missing authors from summary
+  language_results_df <- language_results_df %>% filter(is.na(authors_1_name)) %>% 
+    mutate(extract_authors_from_summary(summary)) %>% 
+    bind_rows(language_results_df %>% filter(!is.na(authors_1_name)))
+  
+  # Remove duplicate results
+  language_results_df <- language_results_df %>% distinct(result_id, .keep_all = TRUE)
+  
+  # 
+  # # Workaround for pmap as list columns cause problems - https://github.com/tidyverse/purrr/issues/846
+  # ls_cols <- language_results_df %>% keep(is.list)
+  # other_cols <- language_results_df %>% keep(~ !(is.list(.x)))
+  # 
+  # plan(multisession, workers = 5) # Parallel API requests to crossref
+  # 
+  # aug_df <- other_cols %>%
+  #   showing_progress(function(...) future_pmap_dfr(..., .options = furrr_options(seed = TRUE)), function(...) {
+  #     df <- tibble(...)
+  #     out <- (possibly(extract_crossref, NULL, FALSE))(df)
+  #     if (is.null(out)) out <- df
+  #     out
+  #   }, steps = nrow(.)) %>%
+  #   cbind(ls_cols)
+  # 
+  # 
+  # 
+  # aug_df$Ys <- lengths(str_extract_all(aug_df$cr_match, "Y"))
+  # 
+  # aug_df[aug_df$Ys == 0, "result"] <- "no_match_delete"
+  # 
+  # message("Translating ", names(language_queries)[1], " results")
+  # 
+  # aug_df[c("title", "snippet")] <- map_dfr(aug_df[c("title", "snippet")], translate)
+  # aug_df[aug_df$Ys != 0, c("abstract", "cr_title")] <- map_dfr(aug_df[aug_df$Ys != 0, c("abstract", "cr_title")], translate)
 
-  plan(multisession, workers = 5) # Parallel API requests to crossref
+  write_rds(language_results_df, glue::glue("results_aligned/scholar_non-English-cyrillic.RDS"))
+  
+```
 
-  aug_df <- other_cols %>%
-    showing_progress(function(...) future_pmap_dfr(..., .options = furrr_options(seed = TRUE)), function(...) {
-      df <- extract_crossref(tibble(...))
-      # if ("doi" %in% names(df) && !is.na(df$doi)) df <- get_citation(df)
-      df
-    }, steps = nrow(.)) %>%
-    cbind(ls_cols)
+#### Translate
 
-  aug_df$language <- names(language_queries)[1]
+Used 
 
 
-  aug_df$Ys <- lengths(str_extract_all(aug_df$cr_match, "Y"))
+```{r}
+language_results_df <- read_rds("results_aligned/scholar_non-English-cyrillic.RDS")
 
-  aug_df[aug_df$Ys == 0, "result"] <- "no_match_delete"
+pacman::p_load(googleLanguageR, openai)
+insistent_request <- possibly(insistently(create_chat_completion), otherwise = list(), quiet = FALSE)
 
-  message("Translating ", names(language_queries)[1], " results")
+gl_auth("google_translate.json")
 
-  aug_df[c("title", "snippet")] <- map_dfr(aug_df[c("title", "snippet")], translate)
-  aug_df[aug_df$Ys != 0, c("abstract", "cr_title")] <- map_dfr(aug_df[aug_df$Ys != 0, c("abstract", "cr_title")], translate)
+translate <- function(x, drop_tags = TRUE, warn = TRUE, engine = c("gl_translate", "gpt")) {
+    if (warn && sum(str_length(x), na.rm = TRUE) > 5000) {
+    if(usethis::ui_nope(glue::glue("Translation of {sum(str_length(x))} characters requested. Continue?"))) return(NULL)
+  }
 
-  save_rds(aug_df, glue::glue("results_aligned/scholar_{names(language_queries)[1]}.RDS"))
+  if (drop_tags) {
+    x <- str_replace_all(x, "<.*?>", " ")
+  }
+  which_NA <- is.na(x)
+  x <- c(na.omit(x))
+  
+  if (engine[1] == "gl_translate") {
+  
+    t <- gl_translate(x)
+    t %>%
+      count(detectedSourceLanguage) %>%
+      transmute(N = paste0(detectedSourceLanguage, ": ", n)) %>%
+      pull() %>%
+      glue::glue_collapse(sep = ", ", last = "&") %>%
+      message("Detected languages: ", .)
+    
+      out <- character(length(which_NA))
+  out[!which_NA] <- t %>% pull(translatedText)
+  out[which_NA] <- NA
+  
+  } else if (engine[1] == "gpt") {
+    
+    
+    future::plan(multisession, workers = 6)
+
+    
+    t <- furrr::future_map_chr(x, .progress = TRUE, \(current){
+    
+  current_resp <- 
+            insistent_request(
+     model = "gpt-3.5-turbo",
+     messages = list(
+        list(
+            "role" = "system",
+            "content" = "You are a translator focused on management and psychology"
+        ),
+        list(
+            "role" = "user",
+            "content" = paste(
+            "Translate to English:
+",
+current
+        )
+    )))
+  
+  r <- current_resp$choices$message.content
+  
+  if (is.null(r)) r <- NA
+
+  r
+  
+})
+
+  out <- character(length(which_NA))
+  out[!which_NA] <- t 
+  out[which_NA] <- NA
+
+  } else {
+  stop("Should not be here")
+}
+
+  out
 }
 ```
-From there:
 
-- run crossref manual merge as per GS and SSRN above
-- do title and snippet screening to decide which abstracts to retrieve
-- retrieve abstracts from links (prob with BeautifulSoup)
-- do full screening
+
+```{r}
+language_results_list <- language_results_df %>% split(.$language)
+
+language_results_list <- imap(language_results_list, \(df, lang) {
+  message("Translating ", lang)
+  df %>% mutate(across(c(title, snippet), ~translate(.x, warn = FALSE), .names = "{.col}_english")) %>% 
+    rename(title_original = title, snippet_original = snippet,
+           title = title_english, snippet = snippet_english)
+})
+
+```
+
+# Process Russian & Ukrainian
+
+```{r}
+# Select 1000 per language for consistency
+set.seed(1234)
+language_results_df <- language_results_df %>% group_by(language) %>% sample_n(1000) %>% ungroup()
+
+language_results_df <- language_results_df %>% 
+  select(-ends_with("english")) %>% 
+  mutate(across(c(title, snippet), 
+                ~translate(.x, engine = "gpt", warn = FALSE), .names = "{.col}_english")) 
+
+
+# Don't add abstracts here so that entries remain more even - let's see if that is better
+language_results_df %>% mutate(journal = summary %>% str_remove("^.*- ") %>% str_remove(" -.*$")) %>% split(.$language) %>% 
+  iwalk(\(df, lang){
+  df %>% transmute(result_id, title = title_english, abstract = paste0(journal, "\n\n", snippet_english), 
+                   url = unlist(link)) %>% 
+    write_csv(glue("results_final/scholar_results_{lang}.csv"))
+})
+
+```
+
+## Add abstracts
+
+Identify where to find abstracts in most common sources
+
+```{r}
+
+unlist_nan <- function(x) {
+  x[map_lgl(x, is.nan)] <- NA
+  unlist(x)
+}
+
+language_results_df %>%  
+  mutate(link = unlist_nan(link) %>% str_remove("#.*$")) %>% 
+  filter(!str_detect(link, "\\.pdf$")) %>% 
+  mutate(domain = link %>% str_remove(".*?\\.") %>% str_remove("/.*")) %>% 
+  group_by(domain) %>% filter(n() >= 20) %>% slice_head(n=2) %>% 
+  select(domain, link) %>% 
+  gt::gt()
+
+language_results_df %>%  
+  mutate(link = unlist_nan(link) %>% str_remove("#.*$")) %>% 
+  filter(str_detect(link, "\\.pdf$")) %>% 
+  mutate(domain = link %>% str_remove(".*?\\.") %>% str_remove("/.*")) %>% 
+  group_by(domain) %>% filter(n() >= 20) %>% slice_head(n=2) %>% 
+  select(domain, link) %>% 
+  gt::gt()
+
+```
+
+rivisteweb.it and torossa.com do not seem to have abstracts
+
+For PDFs, academia.edu links appear broken, redalyc.org does not have abstracts
+
+```{r}
+
+library(rvest)
+
+pdf_workarounds <- c("core.ac.uk", "ac.uk", "bibliotekanauki.pl", ".pl", "koreascience.or.kr", "researchgate.net", "springer.com")
+
+abstracts_tags_specific <- tibble::tribble(
+  ~target_domain, ~tag, ~class, ~note, 
+  "cairn.info", "div", "resume lang-en", NA,
+  "ceeol.com", "p", "summary", NA,
+  "cqvip.com", "td", "sum", NA,
+  "dbpia.co.kr", "div", "abstractTxt", NA,
+  "jstage.jst.go.jp", "div", "article-overiew-abstract-wrap", "id, not class",
+  "scielo.br", "article", "articleText", "id, not class",
+  "repo.nii.ac.jp", "td", "td_detail_line_repos w80", "then get longest - these are all meta-data fields", #Some links there are also direct download links,
+  "springer.com", "div", "Abs1-section", NA,
+  "bibliotekanauki.pl", "p", "abstract-text preserve-whitespace", "if two exist, second likely to be the English one" ,
+  "core.ac.uk", "section", "abstract", "id",
+  "koreascience.org.kr", "div", "article-box", NA,
+  "researchgate.net", "div", "section__abstract", NA,
+  "sciencedirect.com", "div", "abstract author", "2nd likely English, if there are 2",
+  "icm.edu.pl", "div", "articleDetails-abstract", "2nd likely English",
+  "unirioja.es", "ul", "resumen", NA,
+  "jstor.org", "p", "summary-paragraph", NA,
+  "google.com",  "div", "synopsistext", "id"
+)
+
+abstract_names <- c("abstract", "resume")
+frequent_classes <- c("div", "td", "p")
+
+generic_selector <- map(frequent_classes, ~glue("{.x}[class*='{abstract_names}'], {.x}[id*='{abstract_names}']")) %>% 
+  unlist() %>% paste(collapse = ", ")
+
+uastring <- "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36"
+
+httr::set_config(httr::user_agent(uastring))
+
+scrape_abstract <- function(url) {
+  url <- url %>% str_remove("#.*$")
+  domain <- url %>% str_remove(".*?\\.") %>% str_remove("/.*")
+    
+if (str_detect(url, "\\.pdf$")) {
+  if (!domain %in% pdf_workarounds) {
+    return(tibble(url = url, domain = domain, skipped = "pdf"))
+  } else {
+    if (domain %in% c("bibliotekanauki.pl", "koreascience.or.kr", ".pl")) {
+      url <- str_remove(url, "\\.pdf$")
+    } else if (domain == "core.ac.uk" || domain == "ac.uk") {
+      url <- str_replace(url, "/download/pdf/", "/display/") %>% 
+        str_remove("\\.pdf$")
+    } else if (domain == "researchgate.net") {
+      url <- str_extract(url, "^.*publication/.*?/")
+   } else if (domain == "springer.com") {
+      url <- paste0("https://doi.org/", str_extract(url, "10\\..*$") %>% str_remove("\\.pdf"))
+    }
+    scrape_abstract(url)
+  }
+}
+  
+if (domain == "kjjb.org" & str_detect(url, "downloadArticleFile.do")) {
+  # Transform download URLs into links to abstracts
+  url <- url %>% str_extract("id=.*$") %>% str_remove("id=") %>% 
+    {glue("http://www.kjjb.org/CN/abstract/abstract{.}.shtml")}
+} else if (domain == "scielo.br") {
+  url <- url %>% str_replace("/citation/", "/abstract/")
+} else if (str_detect(url, "books.google.com")) {
+  url <- url %>% str_remove("&oi.*")
+}
+
+if (str_detect(url, "create_pdf|downloadArticleFile\\.do|(bitstream.*\\.pdf)")) {
+  cli::cli_alert_danger("Link appears to be a download link. Skipping.")
+  cli::cli_alert_info(paste("URL: ", url))
+  return(tibble(url = url, domain = domain, skipped = "pdf"))
+}  
+
+rate <- rate_backoff(pause_base = 4, max_times = 4)
+
+url_data <- (possibly(insistently(read_html, rate), NULL))(url)
+
+if (is.null(url_data)) {
+                       cli::cli_alert_danger("URL could not be read. Skipping.")
+                       cli::cli_alert_info(paste("URL: ", url))
+                       return(tibble(url = url, domain = domain, skipped = "httperror"))
+
+}
+
+if (domain == "psych.ac.cn") {
+  out <- html_nodes(url_data, "p") %>% html_text() %>% 
+    stringi::stri_enc_toutf8() %>% str_subset("Abstract:") 
+   return(tibble(url = url, domain = domain, abstract = out))
+}
+
+if (domain == "um.ac.id") {
+  out <-  html_nodes(url_data, "div[id='articleAbstract']") %>% 
+    html_text() %>% stringi::stri_enc_toutf8()
+  if (length(out) > 0)    return(tibble(url = url, domain = domain, abstract = out))
+  out <- html_nodes(url_data, "div[class='ep_summary_content_main']") %>% 
+    html_nodes("p") %>% html_text() %>% stringi::stri_enc_toutf8()%>% .[2] 
+   return(tibble(url = url, domain = domain, abstract = out))
+}
+
+if (domain == "upv.es") {
+   out <- html_nodes(url_data, "tr") %>% html_text() %>% 
+     stringi::stri_enc_toutf8()%>% str_subset("Abstract|Resumen") 
+   return(tibble(url = url, domain = domain, abstract = out))
+}
+
+  different <- FALSE
+  tentative <- FALSE
+
+if (domain %in% abstracts_tags_specific$target_domain) {
+  details <- abstracts_tags_specific %>% filter(target_domain == domain)
+  selector <- glue::glue("{details$tag}[id*='{details$class}'], {details$tag}[class*='{details$class}']")
+} else {
+  different <- TRUE
+  selector <- generic_selector
+}
+# Use CSS selectors to extract the text from the div
+out <- div_text <- html_nodes(url_data, selector) %>%
+  html_text() %>% stringi::stri_enc_toutf8() %>% 
+  str_squish_mild() %>%  #Added after initial run!
+  get_longest()
+
+if (length(out) == 0 | is.na(out)) {
+  # As last resort, find the longest paragraph on the page
+  divs <- html_nodes(url_data, "div")
+  texts <- divs[sapply(divs, function(x) length(html_nodes(x, "div")) == 0)] %>% 
+  html_text() 
+  
+  out <- c(texts, html_nodes(url_data, "p, tr") %>% html_text()) %>% 
+    stringi::stri_enc_toutf8() %>% 
+    str_squish_mild() %>%  #Added after initial run!
+    get_longest()
+  
+  tentative <- TRUE
+}
+tibble(url = url, domain = domain, abstract = out, 
+       different_source = different, tentative_extraction = tentative)
+}
+
+plan(multisession, workers = 7)
+
+# Randomly sort links to space out calls to pages in particular language
+links <- language_results_df$link %>% unlist %>% sample()
+```
+
+Retrieve abstracts - might need to split this into a few attempts (1000 links at a time seemed to work robustly)
+Currently retries all URLs up to 4 times - needed for e.g. Researchgate - but could filter so that only some errors are retried to speed this up
+
+```{r}
+scraped <- showing_progress(links %>% set_names(links), future_map, possibly(scrape_abstract, tibble()))
+scraped_df <- scraped %>% bind_rows(.id = "link")
+# Some links will fail due to rate limits - so worth trying once more
+failed_links <- scraped_df %>% filter(skipped == "httperror") %>% pull(url)
+scraped2 <- showing_progress(failed_links %>% set_names(failed_links), future_map, possibly(scrape_abstract, tibble()))
+
+scraped_df <- bind_rows(scraped, scraped2, .id = "link") %>% arrange(url, is.na(abstract)) %>% group_by(url) %>% slice_head(n = 1) %>% ungroup()
+
+language_results_df <- language_results_df %>% mutate(link = unlist(link)) %>% left_join(by = "link",
+                                                                                         scraped_df %>% select(link, abstract, 
+                                                                                                               tentative_extraction_abstract = tentative_extraction))
+
+# Merge now - simple left_join
+
+
+```
+
+```{r}
+cr_search_cols <- language_results_df %>% filter(is.na(abstract) | tentative_extraction_abstract) %>% select(result_id, title, year, authors_1_name, summary)
+
+job::job(title = "Augment GS crossref", {
+  handlers(global = TRUE) 
+handlers(handler_progress(
+  format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+  width    = 60,
+  complete = "=",
+  clear = FALSE
+))
+  plan(multisession, workers = 5) #Parallel API requests to crossref
+  cr_search_cols <- cr_search_cols %>% showing_progress(function(...) future_pmap_dfr(..., .options = furrr_options(seed = TRUE)), function(...) {
+    pacman::p_load(dplyr, stringr, tidyr, rcrossref)
+    source("crossref_and_related.R") #Functions to retrieve and edit citations
+    source("helpers.R") #Helper functions - sometimes simple wrappers to deal safely with NULLs
+    df <- extract_crossref_try(tibble(...))
+      df}, steps = nrow(.)) })
+```
+
+
+```{r}
+cr_search_cols$Ys <- str_count(cr_search_cols$cr_match, "Y")
+
+cr_search_cols_abs <- cr_search_cols %>% filter(Ys == 3) %>% rowwise() %>% 
+  mutate(abstract = (possibly(cr_abstract, NA, quiet = FALSE))(doi))
+
+language_results_df <- cr_search_cols_abs %>% 
+  select(result_id, doi, abstract_cr = abstract) %>% right_join(language_results_df)
+
+language_results_df <- language_results_df %>% mutate(abstract = coalesce(abstract_cr, abstract),
+                                                      tentative_extraction_abstract = case_when(
+                                                        !is.na(abstract_cr) ~ FALSE,
+                                                        TRUE ~ tentative_extraction_abstract
+                                                      ))
+```
+
+
+Remove reference lists
+
+```{r}
+remove_ref_list <- function(string) {
+  str_remove(string, regex("\\. \\([0-9]{4}\\)((, )|( [\"“]{1})).*\\. \\([0-9]{4}\\)((, )|( [\"“]{1}))", dotall = TRUE))
+  
+}
+language_results_df <- language_results_df %>% 
+  mutate(abstract_old = abstract, abstract = remove_ref_list(abstract))
+
+```
+
+Extract English segments of multi-lingual abstract.
+
+```{r}
+language_results_df <- language_results_df %>% rowwise() %>%  
+  mutate(abstract_english = extract_english(abstract)) %>% ungroup()
+```
+
+Use GPT3 model to translate "Western" languages - currently costs <10% of Google Translate (in alphabetic languages)
+Google Translate is cheaper (and seems better) for ideographic languages, as it charges per character, not token
+
+For Russian/Ukrainian, use GPT 3.5 (ChatGPT), which is substantially better (https://blog.inten.to/chatgpt-for-translation-surpassing-gpt-3-e8e34f37befb) - though much slower than the simpler GPT-3 models.
+
+
+```{r}
+
+pacman::p_load(googleLanguageR)
+gl_auth("google_translate.json")
+
+# For comparison between GPT3 and Google Translate
+total_cost <- 0
+google_translate_cost <- 0
+
+translate_if_needed <- function(text_english, text, language) {
+  if (is.na(text) || text == "") return(NA)
+  if (!is.na(text_english) && (str_length(text_english) > 200 || str_length(text) < 2 * str_length(text_english))) {
+    return(text_english)
+  }
+  
+  if (str_length(text) > 1600) {
+    text <- paste(str_sub(text, end = 1000), "...")
+  }
+  
+  if (language %in% c("chinese", "japanese", "korean")) {
+     t <- gl_translate(text)
+     t %>% pull(translatedText)
+  }
+  else {
+    res <- openai::create_completion(model = "text-curie-001",
+                              prompt = paste("Translate this to English: ", text, sep = "\n"),
+                              max_tokens = floor(str_length(text) / 4),
+                              openai_api_key = Sys.getenv("OPENAI_API_KEY"),
+                              temperature = .5)
+  total_cost <<- total_cost + res$usage$total_tokens/1000 * .002
+  google_translate_cost <<- google_translate_cost + str_length(text)/1000 * .02
+  return(res$choices$text)
+        }
+}
+
+abstracts_english <- character()
+id <- character()
+
+
+#Using a for loop to retain WIP in case of errors
+for (i in cli::cli_progress_along(seq_len(nrow(language_results_df[-c(1:198),])), "Translating")) {
+  i <- i + 198
+  abstracts_english[i] <- translate_if_needed(language_results_df$abstract_english[i],
+                                              language_results_df$abstract[i],
+                                              language_results_df$language[i])
+  id[i] <- language_results_df$result_id[i]
+}
+
+language_results_df$abstract_english <- coalesce(abstracts_english, language_results_df$abstract_english)
+  
+```
+
+## Export for snippet screening
+
+```{r}
+
+language_results_df <- language_results_df %>% mutate(journal = summary %>% str_remove("^.*- ") %>% str_remove(" -.*$"))
+
+language_results_list <- language_results_df %>% split(.$language)
+
+iwalk(language_results_list, \(df, lang){
+  df %>% transmute(result_id, title, abstract = paste0(journal, "\n\n", snippet, "\n\n", abstract_english), 
+                   url = unlist(link)) %>% 
+    write_csv(glue("results_final/scholar_results_{lang}.csv"))
+})
+```
+
+```{r}
+imap(language_results_list, \(df, lang) {
+  tibble(language = lang, share_en_abs = mean(!is.na(df$abstract_english)), hits = nrow(df), screen_min = ceiling(hits*.25))
+}) %>% bind_rows() %>% gt::gt() %>% gt::fmt_percent(2, decimals = 0) %>% gt::tab_header("Results after internal deduplication")
+```
