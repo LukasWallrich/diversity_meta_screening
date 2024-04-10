@@ -1,0 +1,713 @@
+---
+title: "Extract citations of included articles"
+output: html_notebook
+---
+
+This process follows [the registration](https://osf.io/f5qdn) created after this meta-analysis was accepted in principle by the Journal of Business and Psychology.
+
+This was run after the full-text screening of articles identified through bibliographic databases and Google Scholar. It was *not* rerun on the articles identified through citation chasing due to capacity constraints.
+
+# Packages used and set-up
+
+```{r}
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, reticulate, readxl, progressr, bib2df, rcrossref, sys)
+
+#Enable progress updates
+#handlers(global = TRUE) <- this needs to be run in the console for now
+ handlers(handler_progress(
+     format   = ":spin :current/:total (:message) [:bar] :percent in :elapsed (remaining: :eta)",
+     width    = 60,
+     complete = "=",
+     clear = FALSE
+   ))
+
+ options(progressr.clear = FALSE)
+
+ 
+#Adds progress bars to map and future_map functions
+showing_progress <- function(x, fn, fn2, ..., steps = length(x)) {
+  if(interactive() && !handlers(global = NA)) stop("To use this function, first run `handlers(global = TRUE)` in the console")
+   p <- progressr::progressor(steps = steps)
+   p(amount = 0)
+   fn(x, function(...) {
+     out <- fn2(...)
+     p()
+     out
+   })
+}
+
+#Import
+source("API_keys.R")
+source("helper-code/crossref_and_related.R") #Functions to retrieve and edit citations
+source("helper-code/helpers.R") #Helper functions - sometimes simple wrappers to deal safely with NULLs
+
+source_python("helper-code/get_scrape_functions.py")
+
+```
+
+# Import article list
+
+```{r load-article-list}
+articles_included <- read_xlsx("result_FT_screening_without_bw.xlsx") %>%
+  filter(str_detect(`Decision (in/out)`, "[Ii]ncl")) %>%
+  select(ID, Title, DOI, Filename) %>%
+  mutate(has_doi = coalesce(str_detect(DOI, fixed("10.")), FALSE))
+
+articles_doi <- articles_included %>% 
+  filter(has_doi) %>% 
+  pull(DOI)
+
+```
+
+## Extract from Scopus
+
+Attempted to extract all references in records with DOI from Scopus - where they were not listed, we fell back to extraction from the full-text PDF.
+
+```{r extract-scopus-refs, eval=FALSE}
+#Sometimes returns inconsistent types - so cannot use map_dfr directly
+
+scopus_refs <- articles_doi %>% showing_progress(map, get_scopus_references) %>% 
+  set_names(articles_doi)
+
+scopus_refs %>% write_rds("bw_chasing_data/scopus_citations.RDS")
+
+```
+
+
+
+## Extract citations from PDFs directly
+
+The above only works for sources indexed in Scopus. For others, GROBID is used to extract references from PDFs - usually, this should be done with a local installation, but that is currently difficult on Macs with M2 and without a Crossref subscription - so we use the web service which appears acceptable for the kind of load expected here. (https://github.com/kermitt2/grobid_client_python/issues/54#issuecomment-1272509755). This makes it rather slow ... approx. 1 min per PDF.
+
+Note that this does not recognise text in PDF scans - these need to be OCR-ed before.
+
+```{r}
+# Following DOIs did not have references in Scopus
+missing_in_scopus <- c("10.1287/orsc.3.3.321", "10.3233/JSA-170052", "10.1108/ajb-11-2016-0036", "10.5465/256987", "10.1037/h0023361", "10.1037/10507-004", "10.1080/13594320143000573", "10.2139/ssrn.2929009", "10.2466/pr0.1993.73.3f.1187", "10.1080/21573727.2011.621419", "10.1057/palgrave.abm.9200130", "10.5465/ambpp.1995.17536282", "10.2139/ssrn.3526586", "10.5465/256761", "10.1002/1097-0266(200009)21:9<911::aid-smj124>3.0.co;2-9", "10.5465/ambpp.2020.11594abstract", "10.5465/amj.2008.33665310", "10.1287/orsc.2021.1560")
+
+articles_PDF_extraction <- articles_included %>% 
+  filter(!has_doi | DOI %in% missing_in_scopus)  
+
+
+articles_PDF_extraction$Filename[articles_PDF_extraction$Filename == "ID_2882; 4347.pdf"] <- "ID_2882_ 4347.pdf"
+
+fs <- file.path("full_text/english_screened", articles_PDF_extraction %>% pull(Filename))
+
+# OCR them (this also compresses the ones already containing text, if that takes 
+# too long, could also first try GROBID and only OCR failures (but GROBID is bottleneck if not run locally)
+showing_progress(fs, walk, \(x) normalizePath(x) %>% {system(glue::glue('ocrmypdf --skip-text "{.}" "{.}"'))})
+
+
+# Request from GROBID
+refs2 <- showing_progress(fs, map, \(f) {
+  f_bib <- paste0(tools::file_path_sans_ext(f), ".bib")
+  # In case earlier attempt failed/timed out, load references rather than skipping
+  if (!file.exists(f_bib)) {
+    bib <- parse_pdf_refs(f)
+    writeLines(bib, f_bib)
+  } else {
+    message("Skipping retrieval for ", basename(f), ". Instead, reading references from .bib file")
+    bib <- read_lines(f_bib)
+  }
+  if (length(bib) == 0 || (length(bib) == 1 && bib[1] == "")) {
+    message("No references found in ", f)
+    return(data.frame())
+  }
+  
+  res <- bib2df::bib2df(f_bib) %>% 
+    collapse_to_string(where(is.list)) 
+  res$database <- paste0("references_", basename(f))
+  res
+}) %>% set_names(fs)
+
+refs <- refs %>% 
+  map(\(x) {x$YEAR <- as.numeric(x$YEAR); x}) %>% 
+  bind_rows() %>% rename_with(tolower)
+
+# Drop small share of references that lack title & booktitle - they are not identifiable
+refs <- refs %>% filter(!(is.na(title) & is.na(booktitle)))
+
+refs %>% write_rds("bw_chasing_data/PDF_citations.RDS")
+```
+
+
+```{r dedup-pdf-citations}
+refs <- read_rds("bw_chasing_data/PDF_citations.RDS")
+
+# Remove duplicates
+refs_dedup <- refs %>% 
+  mutate(articletitle = title, title = paste(replace_na(booktitle, ""), replace_na(articletitle, "")),
+                              label = "", pages = str_replace(pages, "--", "-")) %>%
+  rename(source = database) %>% 
+  ASySD::dedup_citations(manual_dedup = FALSE) %>% 
+  mutate(across(everything(), ~na_if(.x, "")))
+```
+
+
+
+```{r dedup-scopus-citations}
+
+scopus_refs <- read_rds("bw_chasing_data/scopus_citations.RDS")
+scopus_refs_df <- bind_rows_to_list(!!! scopus_refs, .id = "cited_in") %>% 
+  mutate(across(where(is.list), ~unlist_w_NULLs(.x, only_first = TRUE))) 
+
+scopus_refs_dedup <-scopus_refs_df %>% 
+  rename(source = cited_in, journal = sourcetitle, author = authors) %>% 
+  mutate(pages = paste(first, last, "-"), year = str_sub(coverDate, 1, 4),
+         title = coalesce(title, journal)) %>% 
+  bind_rows(
+    refs_dedup %>% rename(prev_duplicate_id = duplicate_id, prev_record_ids = record_ids)
+  ) %>%
+  ASySD::dedup_citations(manual_dedup = FALSE) %>% 
+  mutate(across(everything(), ~na_if(.x, "")))
+
+# Merge entries with duplicate DOI  
+ scopus_refs_dedup <- scopus_refs_dedup %>% 
+  filter(!is.na(doi)) %>% 
+  group_by(doi) %>% 
+  summarise(across(c(everything(), -source), first_nNA),
+            source = paste(source, collapse = ", ")) %>% 
+  ungroup() %>% 
+  bind_rows(scopus_refs_dedup %>% filter(is.na(doi)))
+
+ # Filter scopus_refs
+ # Giving priority to PDF refs (as these were processed before)
+ scopus_refs_only_dedup <- scopus_refs_dedup %>% filter(is.na(prev_duplicate_id))
+
+ 
+```
+
+# Deduplicate against bibliographic DB search results
+
+```{r dedup-against-bibliographic}
+deduplicated_hits <- qs::qread("results_final/final_deduplicated_results.qs") 
+
+all_hits <- deduplicated_hits %>% mutate(record_id = paste0("orig_",row_number()), db = "orig") %>% 
+  bind_rows(refs_dedup %>% mutate(record_id = paste0("PDF_",row_number()), db = "PDF")) %>% 
+  bind_rows(scopus_refs_only_dedup %>% mutate(record_id = paste0("scopus_",row_number()), db = "Scopus")) %>% 
+  rename(old_dup_id = duplicate_id, old_rec_ids = record_ids) %>% select(-abstract)
+
+all_hits %>% group_by(db) %>% 
+  summarise(across(c(author, year, journal, doi, title, pages, volume, number, isbn), timesaveR::na_share))
+
+
+all_hits_dedup <- ASySD::dedup_citations(all_hits, manual_dedup = FALSE)
+
+all_hits_dedup <- all_hits_dedup %>% mutate(in_scopus = str_detect(record_ids, "scopus_"),
+                          in_PDF = str_detect(record_ids, "PDF_"),
+                          in_orig = str_detect(record_ids, "orig_")) 
+
+dedup_counts <- all_hits_dedup %>% 
+  count(in_orig, in_scopus, in_PDF)
+
+refs_dedup <- refs_dedup %>% filter(!duplicate_id %in% 
+                                      (all_hits_dedup %>% filter(in_PDF, in_orig) %>% pull(old_dup_id)))
+
+scopus_refs_only_dedup <- scopus_refs_only_dedup %>% filter(!id %in% 
+                                      (all_hits_dedup %>% filter(in_orig, in_scopus) %>% pull(id)))
+
+refs_dedup %>% write_rds("bw_chasing_data/PDF-refs-final-dedup.RDS")
+scopus_refs_only_dedup %>% write_rds("bw_chasing_data/scopus_refs_only_final_dedup.RDS")
+  
+```
+
+# Augment PDF references
+
+```{r search-cr-PDF-refs}
+refs_dedup <- read_rds("bw_chasing_data/PDF-refs-final-dedup.RDS")
+
+refs_dedup_no_doi <- refs_dedup %>% filter(is.na(doi)) %>% 
+  mutate(query = timesaveR:::paste_(author, timesaveR:::paste_(articletitle, booktitle), year, journal))
+
+my_cr_search <- function(...) {
+  current <- tibble(...)
+  res <- cr_works(query = current$query, limit = 2, cache = TRUE) %>% pluck("data")
+  res$duplicate_id <- current$duplicate_id
+  res$query <- current$query
+  res
+}
+
+# Search ARTICLEs and INBOOK (book chapters) in crossref - others unlikely to have DOIs
+cr_returns <- refs_dedup_no_doi %>% filter(category == "ARTICLE") %>% 
+  showing_progress(pmap, my_cr_search, steps = nrow(.)) %>% bind_rows()
+
+cr_returns <- cr_returns %>% mutate(link = map_chr(link, ~paste0(.x$URL, "")[1]))
+
+cr_returns %>% write_rds("bw_chasing_data/cr_returns_articles.rds")
+
+cr_returns_inbook <- refs_dedup_no_doi %>% filter(category == "INBOOK") %>% 
+  showing_progress(pmap, my_cr_search, steps = nrow(.)) %>% bind_rows()
+
+cr_returns_inbook %>% write_rds("bw_chasing_data/cr_returns_chapters.rds")
+
+
+```
+
+
+```{r match-cr-PDF-results}
+cr_returns <- read_rds("bw_chasing_data/cr_returns_articles.rds")
+
+cr_returns <- cr_returns %>%
+  filter(duplicate_id %in% refs_dedup$duplicate_id) %>% # final deduplication adjusted after cr extraction
+  group_by(duplicate_id) %>% 
+  mutate(score = as.numeric(score),
+         max_score = max(score),
+         diff_score = max(score) - min(score)) %>% 
+  ungroup() %>% 
+  mutate(across(c(created, published.online, issued, published.print), ~str_sub(.x, 1, 4) %>% as.numeric()),
+         year = coalesce(published.print, published.online, issued, created))
+
+
+cr_returns <- cr_returns %>% mutate(doi_in_url = str_detect(link, doi)) 
+
+# In line with OpenCitations, scores > 75 counted as matches
+matches <- cr_returns %>% filter(max_score >= 75, diff_score >= 5) %>% 
+  group_by(duplicate_id) %>% slice_head(n = 1) %>% ungroup()
+
+ambiguous <- cr_returns %>% filter(max_score >= 75, diff_score < 5) 
+
+# Prefer DOI that appears in URL, if only one does
+# (mostly because older Academy of Management articles have two DOIs pointing to same URL )
+ambiguous <- ambiguous %>% group_by(duplicate_id) %>% 
+  mutate(url_decisive = any(doi_in_url) & !all(doi_in_url)) %>% 
+  ungroup()
+
+matches <- ambiguous %>% 
+  filter(url_decisive, doi_in_url) %>% 
+  bind_rows(matches)
+
+ambiguous <- ambiguous %>% 
+  filter(!url_decisive)
+  
+# In remaining cases, recalculate similarity to search string 
+# (as Crossref does not appear to consider journals, so that working papers feature inappropriately)
+
+ambiguous <- ambiguous %>% mutate(
+  authors = map(author, ~if (is.null(.x)) "" else .x %>% pull("family") %>% paste(collapse = ", ")),
+  cr_query = timesaveR:::paste_(authors, title, year, container.title),
+  overlap = RecordLinkage::levenshteinSim(tolower(query), tolower(cr_query))) %>% 
+  group_by(duplicate_id) %>% 
+  mutate(max_lev = max(overlap)) %>% 
+  ungroup()
+
+# Manual inspection and common guidelines suggest that levenshteinSim > .5 indicates that strings are closely related
+# The ~3 cases below that threshold here are not matches
+matches <- ambiguous %>% 
+  group_by(duplicate_id) %>% 
+  slice_max(overlap, n = 1) %>% 
+  ungroup() %>% 
+  filter(overlap >= .5) %>% 
+  bind_rows(matches)
+
+no_match <- ambiguous %>% filter(max_lev < .5) %>% 
+  pull(duplicate_id) %>% unique()
+  
+# Explore lower cr scores
+low_cr <- cr_returns %>% filter(max_score < 75) %>% 
+  mutate(
+  authors = map(author, ~{
+    if (is.null(.x)) return("")
+    if ("family" %in% colnames(.x)) {
+      return(.x %>% pull("family") %>% paste(collapse = ", ")) 
+      }    
+    .x %>% pull("name") %>% paste(collapse = ", ")
+  }),
+  cr_query = timesaveR:::paste_(authors, title, year, container.title),
+  overlap = RecordLinkage::levenshteinSim(tolower(query), tolower(cr_query))) %>% 
+  group_by(duplicate_id) %>% 
+  # Year extraction needs to account for years in titles - so get all, and use last 
+  # assumes no 4 digits in journal names, but that is the case in references here
+  mutate(max_lev = max(overlap), year_diff = abs(year - as.numeric(str_extract_all(query, "\\d{4}",  simplify = T) %>% .[1,] %>% last()))) %>% 
+  ungroup()
+
+ # Setting conditions based on manual review and literature
+ # Years should match (+/- 1 due to online first etc) and strings be similar (> .5)
+matches <- low_cr %>% filter(year_diff <= 1) %>% 
+    group_by(duplicate_id) %>% 
+  slice_max(overlap, n = 1) %>% 
+  ungroup() %>% 
+  filter(overlap > .5) %>% 
+  bind_rows(matches)
+
+low_cr <- low_cr %>% filter(!duplicate_id %in% matches$duplicate_id)
+
+# Where strings are *very* similar, year differences can be ignored (OCR issues or missing years)
+matches <- low_cr %>%
+    group_by(duplicate_id) %>% 
+  slice_max(overlap, n = 1) %>% 
+  ungroup() %>% 
+  filter(overlap > .8) %>% 
+  bind_rows(matches)
+
+low_cr <- low_cr %>% filter(!duplicate_id %in% matches$duplicate_id)
+
+no_match <- c(no_match,
+              low_cr %>% pull(duplicate_id) %>% unique()
+)
+
+cr_returns_inbook <- read_rds("bw_chasing_data/cr_returns_chapters.rds")
+
+cr_returns_inbook <- cr_returns_inbook %>%
+  filter(duplicate_id %in% refs_dedup$duplicate_id) %>% # final deduplication adjusted after cr extraction
+  group_by(duplicate_id) %>% 
+  mutate(score = as.numeric(score),
+         max_score = max(score),
+         diff_score = max(score) - min(score)) %>% 
+  ungroup() %>% 
+  mutate(across(c(created, published.online, issued, published.print), ~str_sub(.x, 1, 4) %>% as.numeric()),
+         year = coalesce(published.print, published.online, issued, created))
+
+cr_returns_inbook <- cr_returns_inbook %>% mutate(
+  authors = map(author, ~{
+    if (is.null(.x)) return("")
+    if ("family" %in% colnames(.x)) {
+      return(.x %>% pull("family") %>% paste(collapse = ", ")) 
+      }    
+    .x %>% pull("name") %>% paste(collapse = ", ")
+  }),
+  cr_query = timesaveR:::paste_(authors, title, year, container.title),
+  overlap = RecordLinkage::levenshteinSim(tolower(query), tolower(cr_query)))
+
+# Here, some Crossref scores are very odd as the references are misformatted and
+# of widely differing lengths - so instead, overlap considered
+# Here, threshold of .5 yields too many false matches - .6 more accurate
+
+matches <- cr_returns_inbook %>% 
+  mutate(link = map_chr(link, ~paste0(.x$URL, "")[1])) %>% 
+  group_by(duplicate_id) %>% 
+  slice_max(overlap, n = 1) %>% 
+  ungroup() %>% 
+  filter(overlap > .6) %>% 
+  bind_rows(matches)
+
+no_match <- c(no_match, cr_returns_inbook %>% 
+  filter(!duplicate_id %in% matches$duplicate_id) %>% 
+  pull(duplicate_id) %>% unique())
+
+```
+
+
+```{r confirm-PDF-DOIs}
+# Check DOIs match references
+refs_dedup_doi <- refs_dedup %>% filter(!is.na(doi)) %>% 
+  mutate(query = timesaveR:::paste_(author, articletitle, booktitle, year, journal))
+
+cr_returns_doi <- refs_dedup_doi$doi %>% showing_progress(map, \(x) cr_works(dois = x, cache = TRUE)) %>% pull("data") %>% bind_rows()
+
+cr_returns_doi <- cr_returns_doi %>% 
+  mutate(across(c(created, published.online, issued, published.print), ~str_sub(.x, 1, 4) %>% as.numeric()),
+         year = coalesce(published.print, published.online, issued, created)) %>% 
+  mutate(authors = map(author, ~{
+    if (is.null(.x)) return("")
+    if ("family" %in% colnames(.x)) {
+      return(.x %>% pull("family") %>% paste(collapse = ", ")) 
+      }    
+    .x %>% pull("name") %>% paste(collapse = ", ")
+  }),
+  doi = tolower(doi)) %>% 
+  left_join(refs_dedup_doi %>% transmute(doi = tolower(doi), query, journal)) %>% 
+  mutate(cr_query = timesaveR:::paste_(authors, title, year, container.title),
+        overlap = RecordLinkage::levenshteinSim(tolower(query), tolower(cr_query)))
+
+# DOI match gives strong prior belief in correctness - so based on inspection, only
+# overlap below .25 excluded
+matches <- cr_returns_doi %>% 
+  mutate(score = as.numeric(score),
+        link = map_chr(link, ~paste0(.x$URL, "")[1])) %>% 
+  filter(overlap >= .25) %>% 
+  bind_rows(matches)
+
+ no_doi_matches <- cr_returns_doi %>% 
+  filter(overlap < .25) %>% 
+   select(query) %>% 
+   left_join(refs_dedup_doi %>% select(duplicate_id, query))
+
+invalid_doi <- setdiff(tolower(refs_dedup_doi$doi), tolower(cr_returns_doi$doi))
+
+# Function to fetch status of a single DOI - see if they are from a different agency
+get_doi_status <- function(doi) {
+  url <- paste0("https://doi.org/ra/", doi)
+  response <- httr::GET(url)
+  if (httr::status_code(response) == 200) {
+    parsed_response <- jsonlite::fromJSON(httr::content(response, "text"))
+    return(data.frame(DOI = parsed_response$DOI, status = c(parsed_response$status, parsed_response$RA)))
+  } else {
+    return(data.frame(DOI = doi, status = "Failed request"))
+  }
+}
+
+# Not the case for any relevant citation
+map_dfr(invalid_doi, get_doi_status)
+
+# Search Crossref without DOI for invalid DOIs
+# Should do this earlier next time - so that this only needs to be done once
+cr_returns_invalid_doi <- refs_dedup_doi %>% filter(tolower(doi) %in% invalid_doi | duplicate_id %in% no_doi_matches$duplicate_id) %>% mutate(doi = NA) %>% 
+  showing_progress(pmap, my_cr_search, steps = nrow(.))
+
+cr_returns_invalid_doi <- cr_returns_invalid_doi %>% bind_rows()
+
+matches <- cr_returns_invalid_doi %>% 
+   group_by(duplicate_id) %>% 
+    mutate(score = as.numeric(score),
+         max_score = max(score),
+         diff_score = max(score) - min(score)) %>% 
+   ungroup() %>% 
+  mutate(across(c(created, published.online, issued, published.print), ~str_sub(.x, 1, 4) %>% as.numeric()),
+         year = coalesce(published.print, published.online, issued, created),
+  authors = map(author, ~{
+    if (is.null(.x)) return("")
+    if ("family" %in% colnames(.x)) {
+      return(.x %>% pull("family") %>% paste(collapse = ", ")) 
+      }    
+    .x %>% pull("name") %>% paste(collapse = ", ")
+  }),
+  cr_query = timesaveR:::paste_(authors, title, year, container.title),
+  overlap = RecordLinkage::levenshteinSim(tolower(query), tolower(cr_query)),
+  link = map_chr(link, ~paste0(.x$URL, "")[1])) %>% 
+  group_by(duplicate_id) %>% 
+  slice_max(overlap, n = 1) %>% 
+  ungroup() %>% 
+  filter((overlap > .8 | score > 75 | str_detect(title, "The Dark Triad and Workplace Behavior"))) %>% 
+  bind_rows(matches)
+
+no_match <- c(no_match, 
+              cr_returns_invalid_doi %>% 
+   filter(!duplicate_id %in% matches$duplicate_id) %>% pull(duplicate_id) %>% unique()) 
+
+
+# Merge entries with duplicate DOIs
+matches <- matches %>% mutate(author = map(author, \(x) if (is.null(x)) NA else x))
+matches <- matches %>% 
+  select(-license, -assertion, -update_to, -reference, -authors, -funder) %>% 
+  left_join(refs_dedup %>% select(duplicate_id, database = source)) %>% 
+  group_by(doi) %>% 
+  summarise(across(c(everything(), -database), ~.x[1]),
+            database = paste(database, collapse = ", ")) %>% 
+ungroup()
+
+# Merge entries with duplicate duplicate IDs (happened due to ties in score and overlap, should have used slice_max with `with_ties = FALSE`)
+matches <- matches %>% 
+  arrange(desc(is.na(doi))) %>% 
+  group_by(duplicate_id) %>% 
+  summarise(across(c(everything(), -database), ~.x[1]),
+            database = paste(database, collapse = ", ")) %>% 
+ungroup()
+```
+
+
+```{r get-scopus-PDF-abstracts}
+
+
+matches$abstract[is.na(matches$abstract)] <- matches$doi[is.na(matches$abstract)] %>% na.omit() %>% 
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+matches %>% write_rds("bw_chasing_data/PDF_matches_w_scopus_abstracts.rds")
+
+```
+
+
+```{r}
+matches <- read_rds("bw_chasing_data/PDF_matches_w_scopus_abstracts.rds")
+
+## Try crossref for remaining DOIs
+matches$abstract[!is.na(matches$doi) & is.na(matches$abstract)] <- 
+  matches$doi[!is.na(matches$doi) & is.na(matches$abstract)] %>% 
+  showing_progress(map, possibly(cr_abstract, ""))
+
+## Leave remaining citations as is - will be screened on title only
+
+refs_PDF_augmented <- refs_dedup %>%
+  filter(!duplicate_id %in% matches$duplicate_id) %>%
+  transmute(duplicate_id,
+    database = "bw_included", doi, source, pubtype = category,
+    author, title, journal, year, volume, issue = number,
+    start_page = str_extract(pages, ".*(?=\\-)"),
+    end_page = str_extract(pages, "(?<=\\-{1,2})\\d+"),
+    publisher, abstract,
+    pubtitle = booktitle
+  ) %>%
+  bind_rows(matches %>%
+    transmute(
+      duplicate_id,
+      source = database, database = "bw_included", doi,
+      author = map_chr(author, ~ {
+        if (is.null(.x) || (length(.x) == 1 && is.na(.x))) {
+          return("")
+        }
+        if ("family" %in% colnames(.x)) {
+          return(.x %>% pull("family") %>% paste(collapse = ", "))
+        }
+        .x %>%
+          pull("name") %>%
+          paste(collapse = ", ")
+      }),
+      title, journal = container.title, year = as.character(year), volume, issue,
+      start_page = str_extract(page, ".*(?=\\-)"),
+      end_page = str_extract(page, "(?<=\\-{1,2})\\d+"),
+      publisher, abstract = map_chr(abstract, 1)
+    ))
+
+refs_PDF_augmented %>% write_rds("bw_chasing_data/final_refs_PDF_augmented.RDS")
+
+```
+
+# Augment Scopus references
+
+```{r get-scopus-abstracts}
+# Add abstracts from CrossRef
+scopus_refs_only_dedup$abstract[!is.na(scopus_refs_only_dedup$doi) & is.na(scopus_refs_only_dedup$abstract)] <- 
+  scopus_refs_only_dedup$doi[!is.na(scopus_refs_only_dedup$doi) & is.na(scopus_refs_only_dedup$abstract)] %>% 
+  showing_progress(map_chr, possibly(~cr_abstract(.x, cache = TRUE), ""))
+
+scopus_refs_only_dedup <- scopus_refs_only_dedup %>% mutate(abstract = abstract %>% na_if("")) 
+
+# Further augment with Scopus
+scopus_refs_only_dedup$abstract[!is.na(scopus_refs_only_dedup$doi) & is.na(scopus_refs_only_dedup$abstract)] <- 
+  scopus_refs_only_dedup$doi[!is.na(scopus_refs_only_dedup$doi) & is.na(scopus_refs_only_dedup$abstract)] %>%  
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x) %>% {get_longer(.[[1]], .[[2]])}})
+
+# Attempt to use scopus IDs to retrieve abstract for remaining resolved references
+scopus_refs_only_dedup$abstract[is.na(scopus_refs_only_dedup$abstract) & scopus_refs_only_dedup$type == "resolvedReference"] <- 
+  scopus_refs_only_dedup$id[is.na(scopus_refs_only_dedup$abstract) & scopus_refs_only_dedup$type == "resolvedReference"] %>%  
+  showing_progress(map_chr, function(x) {
+ get_scopus_abstract(x, id_type = "scopus_id") %>% {get_longer(.[[1]], .[[2]])}})
+
+
+```
+
+
+```{r extract-scopus, message=FALSE}
+scopus_refs_only_dedup_final <- scopus_refs_only_dedup %>% 
+  transmute(scopus_id = id,
+    database = "backwards_chasing_scopus",
+    source,
+    doi,
+    scopus_id = id,
+    title,
+    author,
+    journal,
+    volume,
+    issue,
+    abstract,
+    year = str_sub(coverDate, 1, 4) %>% na_if("NULL"),
+    start_page = first,
+    end_page = last,
+    pubtitle = coalesce(booktitle, journal),
+    pubtype = if_else(str_detect(pubtitle, fixed("journal", ignore_case=TRUE)), "journal-article", NA_character_),
+    publisher = publisher,
+    in_scopus = type == "resolvedReference"
+  )
+
+scopus_refs_only_dedup_final %>% write_rds("bw_chasing_data/final_refs_scopus_augmented.RDS")
+
+```
+
+# Prepare for screening
+
+```{r}
+scopus_refs_only_dedup_final <- read_rds("bw_chasing_data/final_refs_scopus_augmented.RDS")
+refs_PDF_augmented <- read_rds("bw_chasing_data/final_refs_PDF_augmented.RDS")
+
+all_refs <- scopus_refs_only_dedup_final %>% 
+  bind_rows(refs_PDF_augmented)
+
+# Clean abstracts and titles
+clean_abstract <- function(text) {
+    text <- str_remove_all(text, "Copyright ©.*$")  # Remove 'Copyright ©' to the end of the string
+    text <- str_remove_all(text, "©.*$")  # Remove '©' to the end of the string
+    text <- str_remove_all(text, "\\(PsycINFO Database Record \\(c\\) \\d{4} APA, all rights reserved\\)")  # Remove PsycINFO notice
+    text <- str_remove_all(text, "<[^>]+>")  # Remove HTML tags
+    return(text)
+}
+
+remove_ALLCAPS <- Vectorize(function(text) {
+  if (!is.na(text) && str_length(text) > 0 && (str_count(text, "[A-Z]") / str_length(text)) > 0.8) {
+  return(str_to_sentence(text))
+  }
+  text
+}, USE.NAMES = FALSE)
+
+all_refs <- all_refs %>% mutate(
+  abstract = clean_abstract(abstract) %>% remove_ALLCAPS() %>% na_if(""),
+  title = remove_ALLCAPS(title)
+)
+
+# Merge entries with duplicate DOIs - occur when messy PDF references have been cleaned through Crossref matching and now duplicate Scopus
+all_refs <- all_refs %>% 
+  filter(!is.na(doi)) %>% 
+  mutate(doi = tolower(doi)) %>% 
+  group_by(doi) %>% 
+  summarise(across(c(everything(), -source), ~.x[1]),
+            source = paste(source, collapse = ", ")) %>% 
+ungroup() %>% bind_rows(
+  all_refs %>% filter(is.na(doi))
+)
+
+# Remove references that contain no information 
+all_refs <- all_refs %>% naniar::add_n_miss() %>% 
+  filter(n_miss_all < 14) # Remove Scopus results without ANY metadata (~90) %>% 
+  arrange(desc(n_miss_all))
+
+dedup <- all_refs %>% mutate(pages = paste0(start_page, "-", end_page), label = "") %>% rename(number = issue,
+                             old_dup = duplicate_id) %>% ASySD::dedup_citations()
+
+# Add "manual" deduplication based on appropriate thresholds for this case
+dedup$manual_dedup <- dedup$manual_dedup %>% filter((title > .8 & author > .8 & journal > .8) | (title > .8 & author > .8 & year > .8))
+
+first_nNA <- function(x) {
+  x %>%
+    na.omit() %>%
+    first()
+}
+
+manual_pairs <- dedup$manual_dedup %>% select(duplicate_id.x, duplicate_id.y)
+
+# At this stage, ASySD struggled with merging manual pairs correctly -
+# now code similar to the below has been integrated there, so that this should be
+# run within ASySD when reused.
+g <- igraph::graph_from_data_frame(manual_pairs, directed = FALSE)
+cc <- igraph::components(g)
+
+manual_pairs$new_duplicate_id <- cc$membership[match(manual_pairs$duplicate_id.x, names(cc$membership))]
+
+manual_pairs <- manual_pairs %>%
+  pivot_longer(c(duplicate_id.x, duplicate_id.y), names_to = NULL, values_to = "duplicate_id") %>%
+  mutate(new_duplicate_id = paste0("n_", new_duplicate_id))
+
+final_dedup <- dedup$unique %>%
+  left_join(manual_pairs, by = "duplicate_id") %>%
+  mutate(new_duplicate_id = coalesce(new_duplicate_id, duplicate_id)) %>%
+  group_by(new_duplicate_id) %>%
+  summarise(
+    across(c(everything(), -source, -record_ids, -label), first_nNA),
+    across(c(source, record_ids, label), ~ paste(.x, collapse = ", "))
+  ) %>%
+  ungroup()
+
+
+final_dedup %>% write_rds("bw_chasing_data/final_refs_for_screening.RDS")
+final_dedup <- read_rds("bw_chasing_data/final_refs_for_screening.RDS")
+
+final_dedup %>% transmute(id = new_duplicate_id, title, abstract, doi, 
+                    # Add URL that directly searches Google Scholar to speed up coding
+                    url = paste0("https://scholar.google.com/scholar?q=", paste(title, author, year) %>% URLencode())) %>% 
+                      write_csv("bw_chasing_data/final_for_asreview.csv")
+```
+
+### Reporting
+
+```{r}
+glue::glue("
+           Retrieved from Scopus ({length(articles_doi)-length(missing_in_scopus)} sources): {nrow(scopus_refs_df)}
+           Retrieved from PDFs ({length(fs)} sources): {nrow(refs)}
+           After automatic deduplication within and with bibliographic results: {nrow(final_dedup)}
+           ")
+```
+
+*Report is*
+Retrieved from Scopus (358 sources): 28754
+Retrieved from PDFs (93 sources): 8319
+After automatic deduplication within and with bibliographic results: 18048

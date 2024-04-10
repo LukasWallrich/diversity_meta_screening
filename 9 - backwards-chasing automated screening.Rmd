@@ -1,0 +1,254 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+For the backward citation screening, we narrowed down the records for manual screening in two ways:
+- using GPT (3.5 Turbo) with basic screening questions
+- using the pre-registered search strings to identify matches
+
+Those identified in either way were screened manually. Note that this is essentially more inclusive than if we treated references as a database, where only the search string would have been applied.
+
+# Automated screening
+
+```{r}
+library(openai)
+library(tidyverse)
+
+# Remove repeated *same-type* whitespace (either length 1 or 2, to account for newlines)
+str_squish_mild <- function(string) {
+  str_replace_all(string, "(\\s)(\\s)(\\1\\2)+", "\\1\\2") %>%
+  str_replace_all("(\\s)\\1+", "\\1") %>% str_trim()
+}
+
+bw_references <- read_csv("bw_chasing_data/final_for_asreview-manual.csv")
+
+library(stringr)
+library(dplyr)
+
+clean_text <- function(str) {
+  str %>%
+    # Remove editions like "2nd Ed."
+    str_replace_all("(\\d+(?:st|nd|rd|th)\\s*Ed[\\. ])", "") %>%
+    # Remove reference numbers like "[2]"
+    str_replace_all("\\[\\d+\\]", "") %>%
+    # Remove HTML tags
+    str_replace_all("<.*?>", "") %>%
+    # Remove HTML encoded tags
+    str_replace_all("&lt;.*?&gt;", "") %>%
+    # Remove copyright statements
+    str_replace_all("Copyright (?:of the )?(.*?)(, all rights reserved\\.)?\\.", "") %>%
+    # Remove specific redundant strings
+    str_replace_all("Paper presented at the Academy of Management Meeting", "")
+}
+
+# Paste multiple strings together, treating NA and NULL as ""
+paste_ <- function(...) {
+  args <- list(...)
+  args <- lapply(args, function(x) ifelse(is.na(x) | is.null(x), "", x))
+  do.call(paste, args)
+}
+
+
+
+abstracts <- bw_references %>% mutate(abstract = paste_(title, "\n\n", abstract) %>% 
+                                        clean_text() %>%  str_squish_mild(), length = str_length(abstract),
+                                      non_alnum = str_count(abstract,"[^[:alnum:]]")/length)
+
+
+abstracts_distinct <- abstracts %>% distinct(abstract, .keep_all = TRUE) %>% mutate(excluded_auto = FALSE)
+
+# Remove duplicates and parsing errors
+
+abstracts_distinct <- abstracts_distinct %>% mutate(str_dist_to_next = RecordLinkage::jarowinkler(tolower(abstract) %>% str_remove_all("\\s") %>% str_remove_all("[:punct:]"), tolower(lead(abstract)) %>% str_remove_all("\\s") %>% str_remove_all("[:punct:]")), str_dist_to_prev = lag(str_dist_to_next)) %>% 
+  mutate(duplicate_id = cumsum(coalesce(str_dist_to_prev < .95, TRUE))) %>% 
+  group_by(duplicate_id) %>% 
+    mutate(excluded_auto = case_when(
+    # These entries are parsing issues
+    non_alnum > .33 ~ TRUE, 
+    # Duplicates
+    row_number() > 1 ~ TRUE,
+    TRUE ~ excluded_auto)) %>% 
+  ungroup()
+
+abstracts_distinct_request <- abstracts_distinct %>% filter(!excluded_auto)
+
+insistent_request <- possibly(insistently(create_chat_completion), otherwise = list(), quiet = FALSE)
+
+p <- progress_estimated(nrow(abstracts_distinct_request))
+
+resp <- list()
+
+# abstracts <- abstracts %>% arrange(runif(nrow(.)))
+i <- 1
+
+for (i in i:nrow(abstracts_distinct_request)) {
+  
+  current_resp <- 
+            insistent_request(
+    model = "gpt-3.5-turbo",
+    max_tokens = 100,
+     messages = list(
+        list(
+            "role" = "system",
+            "content" = "You are focused on not providing any inaccurate answer, and will rather say that you are unsure."
+        ),
+        list(
+            "role" = "user",
+            "content" = glue::glue(
+            "Fill in this template based on information in the journal article title {if (abstracts[i,]$length > 150) 'and abstract ' else ''}below. Where you are not sure, put NA. Do not return anything else, and do not return the notes.
+
+Article Type: [Quantitative empirical research/Review and meta-analysis/Other]
+NOTE: Quantitative empirical research excludes theoretical papers, qualitative research, reviews, and meta-analyses. If the article is not a quantitative empirical research paper, select the appropriate category.
+
+Concerned with team diversity: [yes/no]
+NOTE: This includes demographic, cognitive or job-related dimensions. Can be referred to as team composition or heterogeneity If there is no such explicit reference, say no.
+
+Concerned with team performance: [yes/no]
+NOTE: This concerns productivity, creativity etc. If it is only about processes (e.g., satisfaction), then say no. If there is no such explicit reference, say no.
+
+Focused on top management teams: [yes/no]
+NOTE: May be referred to as TMT, upper echelons, executive teams.
+
+Focused on firm rather than team performance: [yes/no]
+NOTE: This concerns return on assets/equity/sales, sales growth and similar outcomes.\n
+",
+abstracts_distinct_request$abstract[i]
+        )
+    )))
+  resp[abstracts_distinct_request$id[i]] <- list(current_resp)
+  p$tick()$print()
+}
+
+qs::qsave(resp, "bw_chatgpt_responses_temp3.qs")
+
+```
+
+```{r}
+resp <- qs::qread("bw_chatgpt_responses_temp3.qs")
+
+resp_df <- map_dfr(resp, ~tibble(message = .x$choices$message.content), .id = "ID")
+
+resp_df <- resp_df %>% mutate(message = str_replace_all(message, "\n\n", "\n") %>% str_extract("(?s)Article [tT]ype.*") %>% str_remove_all("\\[.*,.*\\]\\n")) %>% 
+  separate_wider_delim(message, "\n", names = c("type", "diversity", "performance", "tmt", "firm perf"), too_few = "debug", too_many = "drop") %>% 
+  mutate(across(everything(), str_squish)) 
+
+# View responses that could not be parsed correctly - in this case, they are all NA, so not an issue
+resp_df %>% filter(message_ok != "TRUE") %>% pull(message)
+
+# Now use count() interactively on each column to identify answer choices - then mutate to clean them up
+# First identify NAs to ensure that cases where multiple options are returned are not misinterpreted
+resp_df_parsed <- resp_df %>% 
+  mutate(
+    type = timesaveR::na_when(type, str_detect(type, "NA|N/A|not|\\[")) %>% na_if("") %>% 
+      {case_when(str_detect(., regex("empirical", ignore_case = TRUE)) ~ "empirical",
+                str_detect(., regex("review|meta", ignore_case = TRUE)) ~ "review/meta-analysis",
+                str_detect(., regex("other", ignore_case = TRUE)) ~ "other",
+                .default = NA)},
+       diversity = timesaveR::na_when(diversity, str_detect(diversity, "NA|N/A|not|\\[|unc|unsure")) %>% na_if("") %>% 
+      {case_when(str_detect(., regex("yes", ignore_case = TRUE)) ~ "yes",
+                str_detect(., regex("no", ignore_case = TRUE)) ~ "no",
+                .default = NA)},
+           performance = timesaveR::na_when(performance, str_detect(performance, "NA|N/A|not|\\[|unc|unsure")) %>% na_if("") %>% 
+      {case_when(str_detect(., regex("yes", ignore_case = TRUE)) ~ "yes",
+                str_detect(., regex("no", ignore_case = TRUE)) ~ "no",
+                .default = NA)},
+           tmt = timesaveR::na_when(tmt, str_detect(tmt, "NA|N/A|not|\\[|unc|unsure")) %>% na_if("") %>% 
+      {case_when(str_detect(., regex("yes", ignore_case = TRUE)) ~ "yes",
+                str_detect(., regex("no", ignore_case = TRUE)) ~ "no",
+                .default = NA)},
+      `firm perf` = timesaveR::na_when(`firm perf`, str_detect(`firm perf`, "NA|N/A|not|\\[|unc|unsure")) %>% na_if("") %>% 
+      {case_when(str_detect(., regex("yes", ignore_case = TRUE)) ~ "yes",
+                str_detect(., regex("no", ignore_case = TRUE)) ~ "no",
+                .default = NA)}
+  ) 
+
+resp_df_parsed <- resp_df_parsed %>% left_join(abstracts_distinct, by = c("ID" = "id")) %>% 
+  mutate(gpt_result = case_when(
+    # Code clear in/out as well as potential exclusion reasons for faster screening
+    (!is.na(diversity) & diversity != "yes") | 
+    (!is.na(performance) & performance != "yes") |
+      is.na(diversity) ~ "out",
+    is.na(performance) ~ "performance unclear",
+    type == "review/meta-analysis" ~ "review/meta-analysis", 
+    is.na(type) ~ "NA type",
+    type == "other" ~ "other type",
+    tmt == "yes" & `firm perf` == "yes" ~ "tmt & firm performance",
+    `firm perf` == "yes" ~ "firm performance & not tmt",
+    .default = "in"
+  )
+  )
+
+# Conduct search
+# Detect each of the groups of keywords separately
+diverse_pattern <- "(diverse|diversity|heterogenous|heterogeneity|team composition|individual differences)"
+team_pattern <- "(team|group)"
+performance_pattern <- "(performance|creativity|productivity|innovation|effectiveness)"
+
+# Use the patterns with str_detect in a pipe chain
+resp_df_parsed <- resp_df_parsed %>% 
+  mutate(search_result = abstract %>% # Abstract field is title & abstract
+  {str_detect(., diverse_pattern) &
+  str_detect(., team_pattern) &
+  str_detect(., performance_pattern)}
+  )
+
+resp_df_parsed %>% qs::qsave("bw_chasing_data/bw_chasing_auto_screening_df.qs")
+
+resp_df_parsed %>% filter(search_result | gpt_result != "out") %>% 
+  select(id = ID, title, abstract, doi, url, gpt_result) %>% 
+  mutate(abstract = str_remove(abstract, fixed(title))) %>% 
+  arrange(gpt_result) %>% 
+  writexl::write_xlsx("bw_chasing_data/bw_chasing_for_manual_screening.xlsx")
+
+
+
+```
+
+# Report on process
+
+```{r}
+footnote <- glue::glue("Started with {nrow(abstracts)} entries. Also removed duplicated title-abstracts pairs: {nrow(bw_references) - nrow(abstracts_distinct)},<br>and invalid entries ('gibberish' text, often due to character set issues or parsing beyond reference list): {sum(abstracts_distinct$excluded_auto)}.<br>In reporting, remove these from original number of results. Also, removed 2 more during full-text screening that represented chapter titles rather than references. Therefore, funnel should start with {nrow(abstracts_distinct) - sum(abstracts_distinct$excluded_auto) - 2} entries, and the 2 need to be subtracted from table entries.")
+
+resp_df_parsed %>% 
+  mutate(decision = case_when(
+    !search_result & gpt_result == "out" ~ "out due to both",
+    search_result & gpt_result != "out" ~ "passed both",
+    search_result ~ "passed search",
+    gpt_result != "out" ~ "passed GPT",
+    TRUE ~ "coding error"
+  )) %>%
+  count(decision) %>% 
+  gt::gt() %>%
+  gt::tab_header(title = "Summary of automated screening decisions") %>% 
+  gt::tab_source_note(gt::html(footnote))
+
+
+
+```
+
+# Processing after manual screening
+
+```{r}
+bw_screened <- readxl::read_excel("bw_chasing_data/bw_chasing_for_manual_screening-screened.xlsx")
+
+bw_all <- read_rds("bw_chasing_data/final_refs_for_screening.RDS")
+
+bw_screened <- bw_screened %>% filter(decision == "in") %>% select(id, title, doi, url) %>% 
+  left_join(bw_all %>% transmute(id = new_duplicate_id, author, journal = coalesce(journal %>% na_if(""), pubtitle %>% na_if("")), 
+                                 volume, number, abstract, year, pages, database, source))
+
+# Deduplicate against FT screening
+# Should obviously have happened earlier to reduce duplicated screening 
+ft_already <- readxl::read_excel("result_FT_screening_without_bw.xlsx")
+
+bw_screened <- bw_screened %>% filter(is.na(doi) | !tolower(doi) %in% tolower(ft_already$DOI))
+
+bw_screened %>% writexl::write_xlsx("bw_chasing_data/screened_included_full.xlsx")
+
+bw_screened %>% transmute(ID = coalesce(doi, paste0("bw_", id)), author, year, author_year = CiteSource:::generate_apa_citation(author, year),
+                          title, doi, status = "", language = "", filename = paste0(str_replace_all(ID, "/", "--"), ".pdf"), filelink = "", notes = paste("From", source)) %>% 
+  writexl::write_xlsx("bw_chasing_data/screened_included_ft_format.xlsx")
+```
+
+

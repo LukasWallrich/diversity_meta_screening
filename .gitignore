@@ -9,3 +9,11 @@
 search_results
 results_*
 past_review_PDFs
+.httr-oauth
+author_provided_data
+final_emails.xlsx
+emails_specifically_contacted.txt
+email_scrape
+author-data
+full_text
+.lintr

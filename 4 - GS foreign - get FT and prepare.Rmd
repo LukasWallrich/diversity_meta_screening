@@ -1,0 +1,253 @@
+---
+title: "Merge non-English and retrieve PDFs"
+output: html_notebook
+---
+
+This merges screened results from non-English GS searches, then aims to download PDFs
+
+# Merge and report
+
+```{r message=FALSE}
+library(gt)
+library(tidyverse)
+foreign_files <- list.files("results_screened/non-English/")
+
+screened <- map(.progress = TRUE, foreign_files, \(f) {
+  read_csv(file.path("results_screened/non-English/", f)) %>% 
+    mutate(language = f %>%
+             str_remove("asreview_") %>%
+             str_remove("\\.csv$")
+    )
+}) %>% bind_rows() %>% 
+  group_by(result_id) %>% 
+  arrange(is.na(screened)) %>% 
+  slice_head(n = 1) %>% 
+  ungroup()
+
+```
+
+```{r}
+tab <- screened %>% 
+  mutate(included = factor(included)) %>% 
+  count(language, included, .drop = FALSE) %>% 
+  pivot_wider(names_from = included, values_from = n) %>% 
+  transmute(language, retrieved = `0` + `1` + `NA`, screened = `0` + `1`, `%` = screened / retrieved, relevant = `1`) %>% 
+  mutate(language = str_to_title(language)) %>% 
+  rename_with(str_to_title) %>% 
+  gt::gt() %>% 
+  timesaveR::gt_apa_style() %>% 
+  gt::fmt_percent(columns = `%`, decimals = 1) %>% 
+  gt::fmt_number(columns = Retrieved, decimals = 0) %>% 
+  gt::grand_summary_rows(columns = c(everything(), -`%`, -Language), fns = c("Total" = ~sum(.)),
+                         fmt = ~fmt_number(., decimals = 0)) %>% 
+  gt::grand_summary_rows(columns = c(`%`), fns = c("Average screened" = ~mean(.)),
+                         fmt = ~fmt_percent(., decimals = 1)) %>% 
+  gt::tab_header(md("**Summary of screening the non-English records**")) %>% 
+  tab_footnote("For each language, 1000 entries were retrieved from Google Scholar - lower numbers here are due to internal duplication.", 
+               cells_column_labels(Retrieved))
+
+tab %>% gtsave("reports/non-English-screening-summary.docx")
+tab %>% gtsave("reports/non-English-screening-summary.html")
+
+tab
+
+```
+
+# Merge with full search results
+
+```{r}
+# Note that these contain more Russian and Ukrainian results due to multiple search_strings - 
+# 1000 each were sampled afterwards for ASReview, so that balanced sample results from merging
+gs_results <- read_rds("results_aligned/scholar_non-English-cyrillic.RDS") %>% 
+  bind_rows(read_rds("results_aligned/scholar_non-English-non-cyrillic.RDS")) %>%
+  group_by(result_id) %>% 
+  slice_head(n = 1) %>% 
+  ungroup()
+
+gsne_included <- screened %>% filter(included == 1) %>% 
+  left_join(gs_results %>% select(-title, -language)) %>% 
+  mutate(record_id = paste0("gsne_", row_number()),
+         notes = coalesce(notes, exported_notes_1)) %>% 
+  select(-exported_notes_2, exported_notes_1)
+
+lang_strings <- c(
+  german = 'de',
+  chinese = 'cn',
+  spanish = 'es',
+  italian = 'it',
+  polish = 'pl',
+  japanese = 'ja',
+  korean = 'ko',
+  portuguese = 'pt',
+  french = 'fr',
+  indonesian = 'id',
+  russian = "ru",
+  ukrainian = "uk"
+)
+
+gsne_included <- gsne_included %>% mutate(rec_id_old = record_id, record_id = paste0(record_id, "_", lang_strings[language])) %>% select(-rec_id_old)
+
+```
+
+# Extract PDFs
+
+```{r}
+get_PDF <- function(url, id, downloaded) {
+  if (downloaded) return(downloaded)
+  
+  if (!is.na(url) & str_detect(url, "pdf|PDF")) { 
+    res <- possibly(download.file, otherwise = 5)(url, paste0("full_text/gsne/", id, ".pdf"))
+  
+    if (res == 0) res <- TRUE else res <- FALSE
+    message("URL: ", url, c(" failed", " succeeded")[res + 1])
+  } else if (!is.na(url)) {
+    # Check whether link that does not specify .pdf still returns a pdf
+    response <-  possibly(httr::GET, otherwise = NULL)(url)
+    if (is.null(response)) {
+      message("URL: ", url, " timed out")
+      return(FALSE)
+    }
+    # If it's a PDF, download and save
+    if(httr::http_type(response) == "application/pdf"){
+      res <- possibly(download.file, otherwise = 5)(url, destfile = paste0("full_text/gsne/", id, ".pdf"), mode = "wb")
+      if (res == 0) res <- TRUE else res <- FALSE
+      message("URL: ", url, c(" failed", " succeeded")[res + 1])
+    } else {
+      message("URL: ", url, " does not return PDF")
+      res <- FALSE
+    }
+  } else {
+    res <- FALSE
+  }
+  res
+}
+
+gsne_included <- gsne_included %>% 
+  rowwise() %>% 
+  mutate(downloaded = get_PDF(resource_link, record_id, downloaded)) %>% 
+  ungroup()
+
+gsne_included <- gsne_included %>% mutate(link = map(link, 1) %>% unlist())
+
+count(gsne_included, downloaded, is.na(link))
+```
+
+## Manual download
+
+```{r}
+# Open remaining links
+gsne_included %>% filter(!downloaded, !is.na(resource_link)) %>% 
+  pull(resource_link) %>% walk(browseURL)
+
+# Show to support file renaming
+gsne_included %>% filter(!downloaded, !is.na(resource_link)) %>% 
+  select(record_id, title)
+
+# Identify which have been downloaded
+new_ids <- list.files(rstudioapi::selectDirectory()) %>% str_remove(".pdf")
+gsne_included$downloaded[gsne_included$record_id %in% new_ids] <- TRUE
+
+```
+
+From links rather than resource links
+
+```{r}
+# Open remaining links
+lang_links <- gsne_included %>% filter(!downloaded, !is.na(link)) %>% split(.$language)
+
+# Split by language to avoid overwhelming browser
+map(lang_links, \(df) {
+  df %>% pull(link) %>% walk(browseURL)
+df %>% select(record_id, title) %>% gt::gt() %>% gtsave(tempfile(fileext = ".html")->>tf)
+browseURL(tf)  
+browser() # To stop after each language, and proceed manually when that is done
+})
+
+# Identify which have been downloaded
+new_ids <- list.files("full_text/gsne/") %>% str_remove(".pdf")
+gsne_included$downloaded[gsne_included$record_id %in% new_ids] <- TRUE
+
+```
+
+Add exclusions during this "abstract" screening (only had GS snippets in many cases before)
+
+```{r}
+exclusions <- read_csv("full_text/gsne/exclusions.csv") %>% mutate(exclusion_reason = reason) %>% select(-excluded)
+
+gsne_included <- gsne_included %>% 
+  left_join(exclusions) %>% 
+  mutate(downloaded = if_else(!is.na(exclusion_reason), "excluded", as.character(downloaded)))
+
+```
+
+Deal with articles that have no links (Google Scholar citations) - check if a) can find author profile and b) if it is shown there
+
+```{r}
+#NB: This code does not work correctly on final 10 - gt table row has to be run manually to get final table, 
+#including the last row.
+no_urls <- gsne_included %>% filter(downloaded == "FALSE") %>% filter(link == "NaN") %>% select(record_id, result_id)
+for (i in seq_len(nrow(no_urls))) {
+  if (i %% 10 == 0) {#Halt every 10 entries to avoid CAPTCHA
+    no_urls[(i-10):(i-1),] %>% gt::gt() %>% gtsave(tempfile(fileext = ".html")->>tf)
+browseURL(tf) 
+    browser() 
+  }
+  browseURL(paste0("https://scholar.google.com/scholar?cites=", no_urls$result_id[i]))
+}
+```
+
+Add status for those in progress
+
+```{r}
+in_progress <- read_csv("full_text/gsne/in_progress.csv")
+
+gsne_included <- gsne_included %>% select(-any_of("status")) %>% 
+  left_join(in_progress) %>% 
+  mutate(downloaded = if_else(!is.na(status), "in_progress", as.character(downloaded)))
+
+```
+
+# Prep for screening sheet
+
+```{r}
+collapse_without_na <- function(...) {
+  out <- glue::glue_collapse(na.omit(c(...)), sep = ", ", last = " & ")
+  if (length(out) == 0) out <- NA
+  out
+}
+
+gsne_included %>%
+  arrange(desc(downloaded == "TRUE")) %>% 
+  rowwise() %>% 
+  mutate(author = collapse_without_na(authors_1_name, authors_2_name, authors_3_name, 
+                                      authors_4_name, authors_5_name, authors_6_name),
+         notes = collapse_without_na(exclusion_reason, status)) %>% 
+  ungroup() %>% 
+  transmute(record_id, author, year, author_year = NA, title, doi = NA, downloaded, language, url = NA, notes) %>% 
+  clipr::write_clip()
+```
+
+# Translate PDFs
+
+Most were translated with translate.google.com for free (by using the browser interface), yet scanned PDFs requiring OCR had to be translated through the API (0.08 USD per page).
+
+```{r}
+library(reticulate)
+library(dplyr)
+library(stringr)
+use_miniconda("r-reticulate")
+source_python("helper-code/translate_file.py")
+
+files <- list.files("full_text/gsne/selected/", "\\.pdf") 
+
+in_paths <- file.path("full_text/gsne/selected", files)
+out_paths <- file.path("full_text/gsne/selected/trans", files)
+
+purrr::walk2(in_paths, out_paths, \(infile, outfile) {
+  tmp <- tempfile(fileext = ".pdf")
+  # Remove any text that throws off OCR (sometimes page numbers are machine-readable, in which case only they would be translated)
+  system(paste("python3 ./full_text/gsne/selected/remove_PDF_text.py", infile, tmp))
+    translate_pdf(tmp, outfile, source_lang = str_extract(infile, "[a-z]{2}(?=\\.pdf$)") %>% str_replace("cn", "zh"))
+})
+```
+

@@ -1,0 +1,550 @@
+---
+title: "Retrieving full-text"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+
+source("helpers.R") #Helper functions - sometimes simple wrappers to deal safely with NULLs
+source("crossref_and_related.R") #Functions to retrieve and edit citations
+
+
+```
+
+## Collating results
+
+### Merge main search back with metadata
+
+```{r}
+deduplicated_hits <- qs::qread("results_final/final_deduplicated_results.qs")
+screened_hits <- read_csv("results_screened/asreview_main.csv")
+
+included <- screened_hits %>% filter(included == 1) %>% 
+  mutate(notes = coalesce(exported_notes_1, exported_notes_2, exported_notes_3, exported_notes_4)) %>% 
+  select(-starts_with("exported_notes_"))
+
+included %>% write_csv("results_screened/asreview_main_notes_merged.csv")
+
+# Checked the merge - no discrepant titles
+included_aug <- included %>% left_join(deduplicated_hits %>% select(duplicate_id, database = source, database_detail, 
+                                                    year, journal, pub_type,
+                                                    volume, issue, resource_link, 
+                                                    gs_result_id, scopus_id, citation_count, citation_link
+                                                    ))
+
+# Merge two obvious duplicates identified in Excel
+manual_merge <- deduplicated_hits %>% filter(author == "Griest, Debra Lynn") %>% 
+    summarise(across(c(author, title, abstract, pub_type, journal), get_longest),
+            across(c(citation_link, issue, volume, start_page, end_page, publisher, year), ~na.omit(unique(.x))[1]),
+            citation_count = list(tibble(source = database, citation_count = citation_count) %>%
+                                    filter(!is.na(citation_count))),
+            resource_link = list(tibble(source = database, resource_link = resource_link) %>%
+                                    filter(!is.na(resource_link))),
+            source = glue::glue_collapse(database, sep = "; "),
+            rowid = glue::glue_collapse(record_id, sep = "; ")) %>% transmute(duplicate_id = "-999", database = source,
+                                                    year, journal, pub_type,
+                                                    volume, issue, resource_link, 
+                                                    citation_count, citation_link
+                                                    )
+
+included_aug <- included_aug %>% filter(!is.na(duplicate_id)) %>% 
+  bind_rows(included %>% filter(is.na(duplicate_id)) %>% 
+              select(-duplicate_id) %>% 
+              bind_cols(manual_merge))
+
+included_aug %>% qs::qsave("results_screened/asreview_main_augmented.qs")
+```
+
+### Retrieve initial round manually!
+
+(could also have been done with scihub if that was legal and scihub.se still working - with something like the following code)
+
+```{r}
+for (i in 1:nrow(included_aug)) {
+    if (!is.na(included_aug$doi[i])) {
+    fn <- paste0("full_text/", str_replace(included_aug$doi[i], "/", "--"), ".pdf")
+    if (!file.exists(fn)) {
+           res <- possibly(scihubr::download_paper)(included_aug$doi[i], 
+                              fn,  
+                              open = FALSE)
+               if (!file.exists(fn)) message("\nFail with ", included_aug$doi[i])
+
+    }
+    }
+}
+```
+
+Keep track of what is retrieved
+
+```{r}
+dois_retrieved <- list.files("full_text/") %>% str_replace("--", "/") %>% str_remove(fixed(".pdf"))
+
+included_aug <- included_aug %>% mutate(retrieved = if_else(doi %in% dois_retrieved, "pdf_downloaded", NA))
+```
+
+Retrieve from URLs
+
+```{r}
+urls <- included_aug %>% filter(is.na(retrieved)) %>% filter(map_int(resource_link, nrow) > 0) %>% 
+  select(duplicate_id, resource_link)
+
+urls <- map2_dfr(urls$duplicate_id, urls$resource_link, \(id, links) {
+  if (is.character(links)) {
+    out <- tibble(duplicate_id = id, resource_link = links)
+  } else if (is.data.frame(links)) {
+    if (is.character(links$resource_link)) {
+      links$duplicate_id <- id
+      out <- links  
+    } else if (is.list(links$resource_link)) {
+      out <- bind_rows(links$resource_link) %>% mutate(duplicate_id = id)
+      if (is.list(out$resource_link)) {
+              out <- bind_rows(out$resource_link) %>% mutate(duplicate_id = id)
+      }
+    } else {
+    browser()
+    }
+  } else {
+    browser()
+  }
+  out %>% mutate(resource_link = resource_link%>% str_remove(fixed('list("')) %>% str_remove(fixed('")')))
+})
+
+urls <- urls %>% filter(resource_link != "")
+
+first_urls <- urls %>% arrange(-str_detect(resource_link, "pdf")) %>% 
+  group_by(duplicate_id) %>% slice_head(n = 1) %>% ungroup()
+
+first_urls %>% filter(str_detect(resource_link, "pdf")) %>% pwalk(\(...){
+  current <- tibble(...)
+  fn <- paste0("full_text/ID_", current$duplicate_id, ".pdf")
+  try(download.file(current$resource_link, fn))
+})
+
+IDs_retrieved <- list.files("full_text/", pattern = "ID_") %>% str_remove("ID_") %>% str_remove(fixed(".pdf"))
+
+included_aug <- included_aug %>% mutate(retrieved = if_else(duplicate_id %in% IDs_retrieved, "pdf_downloaded_resource_link", retrieved))
+#This time preferentially select non-PDF links
+remaining_urls <- urls %>% filter(!duplicate_id %in% IDs_retrieved) %>% 
+  arrange(str_detect(resource_link, "pdf")) %>% 
+  group_by(duplicate_id) %>% slice_head(n = 1) %>% ungroup()
+
+remaining_urls <- remaining_urls %>% mutate(doi = str_extract(resource_link, "(10\\..+).*") %>% str_replace("%2F", "/") %>% 
+  str_extract( "^(.*?/.*?)(?=\\?|&|/|$)"))
+
+remaining_urls %>% select(-doi) %>% write_csv("results_final/urls.csv")
+
+##
+included_aug %>% mutate(filename = case_when(retrieved == "pdf_downloaded" ~ 
+                                               paste0(str_replace(doi, "/", "--"), ".pdf"),
+                                             retrieved == "pdf_downloaded_resource_link" ~
+                                               paste0("ID_", duplicate_id, ".pdf")),
+                        ID = coalesce(doi, duplicate_id)) %>% 
+  filter(!is.na(retrieved)) %>% 
+  transmute(ID, author, year, citation = CiteSource:::generate_apa_citation(author, year),
+            title, doi, status = "", filename) %>% 
+  write_csv("results_final/retrieved_hits.csv")
+
+
+
+```
+
+
+```{r}
+library(rvest)
+
+ndltd <- remaining_urls %>% filter(str_detect(resource_link, fixed("ndltd.org"))) %>% 
+  mutate(resource_link = str_remove(resource_link, regex('", .*$', dotall = TRUE)) %>% 
+           str_remove('list\\(c\\("'))
+
+ndltd <- pmap_dfr(ndltd, \(...) {
+  current <- tibble(...)
+    # Load the webpage
+webpage <- read_html(current$resource_link)
+
+# Find the h5 tag with the text "Links & Downloads"
+h5_tag <- webpage %>% 
+  html_nodes("h5") %>% 
+  html_text() %>% 
+  grep("Links & Downloads", .)
+
+# Check if the h5 tag is found
+if (length(h5_tag) == 0) {
+  cat("The h5 tag 'Links & Downloads' was not found.")
+  current
+} else {
+  # Get the next div after the h5 tag
+  next_div <- webpage %>%
+    html_nodes(xpath = paste0("(//div/h5)[", h5_tag, "]/parent::div/parent::div"))
+    # Extract the href of links in the next div
+  links <- next_div %>% 
+    html_nodes("a") %>% 
+    html_attr("href")
+
+  # Print the extracted links
+  cat("Links extracted:\n")
+  cat(paste(links, sep = "\n"))
+  
+  current$download_link <- links[1]
+  current
+}
+  
+})
+
+remaining_urls <-ndltd %>% mutate(old = resource_link, resource_link = download_link, ndtld_link = old) %>% select(-old) %>% 
+  bind_rows(remaining_urls %>% filter(!str_detect(resource_link, fixed("ndltd.org"))))
+
+```
+
+
+### Download from key open access sources
+
+#### SSRN
+
+```{r}
+
+library(httr)
+
+URL <- "https://doi.org/10.2139/ssrn.4119886" # Specify the DOI here
+r <- GET(URL, followlocation = TRUE) # Redirects help follow to the actual domain
+
+urls <- r$url
+
+headers <- c("User-Agent" = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:100.0) Gecko/20100101 Firefox/100.0")
+
+for (url in urls) {
+    page <- read_html(url, headers=headers)
+    pdf_url <- paste0("https://papers.ssrn.com/sol3/", html_attr(html_nodes(page, "a[data-abstract-id]"), "href"))
+    filename <- paste0(strsplit(url, "=")[[1]][2], ".pdf")
+    
+    cat(sprintf("Downloading %s as %s\n", pdf_url, filename))
+    
+    download.file(pdf_url, destfile = filename, method = "auto", headers = headers, extra = add_headers("Referer" = url))
+}
+```
+
+
+
+# Manually identified duplicates
+
+```{r}
+# Manual entries
+  #     Superseded by 27781	84	26745
+  #     Likely superseded by 24625 - confirm with authors	780	25688
+  #     Available in 3567	80	26390
+
+dupl <- read_csv("results_final/manual_dedup.csv")
+
+dupl <- dupl %>% group_by(NEW_duplicate_ID) %>% 
+  summarise(new_id = glue::glue_collapse(duplicate_id, "; ")) %>% 
+  left_join(dupl) %>% select(-NEW_duplicate_ID)
+
+included_aug <- included_aug %>% left_join(deduplicated_hits %>% select(duplicate_id, language)) %>% 
+  left_join(dupl)
+
+included_aug <- included_aug %>% mutate(ID = coalesce(doi, duplicate_id))
+
+unique_incl <- included_aug %>% filter(is.na(new_id))
+
+merged <- included_aug %>% filter(!is.na(new_id)) %>% group_by(new_id) %>% 
+  summarise(res = sum(!is.na(retrieved))) %>% filter(res != 2) %>% select(-res) %>% left_join(included_aug) %>% 
+  group_by(new_id) %>% 
+        summarise(across(c(author, title, abstract, pub_type, journal), get_longest),
+            across(c(citation_link, issue, volume, year, language), ~na.omit(unique(.x))[1]),
+            citation_count = list(tibble(source = database, citation_count = citation_count) %>%
+                                    filter(!is.na(citation_count))),
+            resource_link = list(tibble(source = database, resource_link = resource_link) %>%
+                                    filter(!is.na(resource_link))),
+            database = glue::glue_collapse(database, sep = "; "),
+            rowid = glue::glue_collapse(record_id, sep = "; "))
+
+
+included_aug <- bind_rows(
+  unique_incl, merged,
+  included_aug %>% filter(!is.na(new_id)) %>% group_by(new_id) %>% 
+  summarise(res = sum(!is.na(retrieved))) %>% filter(res == 2) %>% select(-res) %>% left_join(included_aug)
+) %>% mutate(duplicate_id = coalesce(new_id, duplicate_id))
+                                    
+```
+
+
+#### Rename downloads from collaborator
+
+```{r}
+
+names_in <- list.files("full_text/victoria/")
+
+names_in %>% str_remove(" -.*$") %>% str_remove(" -.*$") %>% 
+  str_remove(" \\(.*$") %>% str_replace_all("_ ", "; ") -> file_ids
+
+map_chr(ids, ~included_aug$ID[included_aug$duplicate_id == .x]) %>% 
+
+ {paste0("full_text/victoria/", str_replace(., "/", "--"), ".pdf")} -> files_to
+
+file.rename(paste0("full_text/victoria/", names_in), files_to)
+
+
+##
+names_in <- list.files("full_text/victoria/")
+names_in %>% str_remove(fixed(".pdf")) %>% str_replace_all("--", "/") -> IDs
+
+included_aug$retrieved[included_aug$ID %in% IDs] <- "pdf_downloaded_victoria"
+
+
+# Add URLs
+urls_add <- read_csv("results_final/URL-additions.csv") %>% mutate(duplicate_id = as.character(duplicate_id))
+
+
+urls <- map2_dfr(urls$duplicate_id, urls$resource_link, \(id, links) {
+  if (is.character(links)) {
+    out <- tibble(duplicate_id = id, resource_link = links)
+  } else if (is.data.frame(links)) {
+    if (is.character(links$resource_link)) {
+      links$duplicate_id <- id
+      out <- links  
+    } else if (is.list(links$resource_link)) {
+      out <- bind_rows(links$resource_link) %>% mutate(duplicate_id = id)
+      if (is.list(out$resource_link)) {
+              out <- bind_rows(out$resource_link) %>% mutate(duplicate_id = id)
+      }
+    } else {
+    browser()
+    }
+  } else {
+    browser()
+  }
+  out %>% mutate(resource_link = resource_link%>% str_remove(fixed('list("')) %>% str_remove(fixed('")')))
+})
+
+included_aug %>% left_join(urls_add) %>% mutate(resource_link = map_chr(resource_link, ~x$resource_link[1] %>% timesaveR::na_when(length(.) == 0)) %>% coalesce(URL, .)) %>% select(-URL) %>% 
+  rename(Email = `Contact email`, download_status = Status) %>% count(is.na(resource_link))
+
+included_aug <- urls %>% bind_rows(urls_add %>% rename(resource_link = URL)) %>% rename(url = resource_link) %>% left_join(included_aug, .)
+
+included_aug <- included_aug %>% group_by(duplicate_id) %>% slice_head(n = 1) %>% ungroup()
+  
+  included_aug %>% qs::qsave("results_final/included_aug_post_victoria_dedup.qs")
+
+    included_aug <- qs::qread("results_final/included_aug_post_victoria_dedup.qs")
+  
+included_aug %>% transmute(ID, title, abstract, doi, author, language, notes, included = NA, retrieved = !is.na(retrieved), url, Status, `Contact email`) %>% write_csv("results_final/input_victoria_2nd.csv", na = "")
+
+
+```
+
+# Add URLs to missing entries
+
+Some entries in the full-text retrieval sheet lost their URLs - they are added back in here, either from the original search or as a Google Scholar search query to assist.
+
+```{r}
+victoria_wip <- readxl::read_excel(file.choose())
+
+missing_url <- victoria_wip %>% filter(is.na(url), is.na(included), !retrieved) %>% filter(!str_detect(title, "BASK"))
+
+included_aug %>% filter(ID %in% missing_url$ID) %>% count(database, sort = TRUE)
+
+psych_urls <- ebsco_psy_bs %>% filter(title %in% missing_url$title) %>% select(title, url) %>% mutate(url = str_remove(url, " and .*$"))
+
+other_entries <- missing_url %>% filter(!title %in% psych_urls$title) %>% select(ID) %>% 
+  left_join(included_aug) %>% 
+  mutate(url = paste0("https://scholar.google.com/scholar?q=", URLencode(paste(author, title, sep = " ")))) %>% 
+  select(title, url)
+
+missing_url <- missing_url %>% select(ID, title) %>% 
+  left_join(bind_rows(psych_urls, other_entries)) %>% 
+  rename(new_url = url)
+
+victoria_wip %>% left_join(missing_url) %>% 
+  filter(!is.na(new_url)) %>% 
+  mutate(url = new_url) %>% 
+  select(-new_url) %>% 
+  writexl::write_xlsx(file.choose())
+
+```
+
+# Search for published versions of AOM presentations
+
+We would expect that many AOM presentations result in papers.
+
+```{r}
+aom_proceedings <- included_aug %>% 
+  filter(str_detect(doi, "ambpp"), !str_detect(doi, "symp"))
+
+cr_res <- pmap(aom_proceedings[1:3, ] %>% select(doi, year, author, title, abstract), \(...) {
+  current <- tibble(...)
+  cr_current_res <- rcrossref::cr_works(flq = c(query.author = current$author, query.bibliographic = current$title), limit = 5, sort='relevance', select = c('DOI', 'title', 'author', 'published-print', 'published-online', 'abstract'))
+  
+  cr_current_res <- cr_current_res$data %>% 
+    ensure_column_exists("published.print") %>% 
+    ensure_column_exists("published.online") %>% 
+    mutate(authors = collapse_author_df(author),
+           year = coalesce(published.print, published.online) %>% 
+             str_extract("[0-9]{4}"))
+  
+  crn <- cr_current_res %>% filter(tolower(doi) != tolower(current$doi),
+                            year >= current$year) %>% slice_head(n = 1) %>% 
+    select(-author, -matches("published")) %>% rename(author = authors) %>% 
+    rename_with(~paste0("cr_", .x)) %>% bind_cols(current %>% rename_with(~paste0("orig_", .x)), .) %>% 
+    mutate(author_sim = RecordLinkage::jarowinkler(cr_author, orig_author),
+           title_overlap = count_common_words(cr_title, orig_title)/min(str_length(c(cr_title, orig_title))))
+})
+
+```
+
+# Link new PDFs to data
+
+```{r}
+PDF_folder <- rstudioapi::selectDirectory()
+pdf_names <- list.files(PDF_folder)
+pdf_details <- data.frame(pdf_name = pdf_names) %>% mutate(ID = str_remove(pdf_name, "\\.\\(.*") %>% str_remove(" -.*") %>% str_remove(fixed(".pdf")) %>% str_remove(fixed("ID_")),
+                                                           is_doi = str_detect(ID, "^10\\."), DOI = str_replace_all(ID, "--", "/"))
+doi_lookup <- tibble::tribble(
+  ~doi_real, ~doi_filename,
+  "10.1002/(sici)1097-0266(199607)17:7<571::aid-smj817>3.0.co;2-c", "10.1002/(sici)1097",
+  "10.1002/1097-0266(200009)21:9<911::aid-smj124>3.0.co;2-9", "10.1002/1097-0266(200009)21-9_911/aid-smj124_3.0.co_2-9",
+  "10.1093/acprof:oso/9780199861378.003.0012", "10.1093/acprof/oso/9780199861378.003.0012",
+  "10.1002/(sici)1099-1379(199705)18:3<275::aid-job796>3.0.co;2-c", "10.1002/(sici)1099-1379"
+) %>% {set_names(pull(., doi_real), .$doi_filename)}
+
+doi_df <- pdf_details %>% filter(is_doi) %>% mutate(filename = paste0(str_replace_all(DOI, "/", "--"),".pdf"),
+                                                    DOI = coalesce(doi_lookup[DOI], DOI))
+dois <- doi_df %>% pull(DOI)
+
+# All DOIs should match a retrieved result
+included_aug <- qs::qread("results_final/included_aug_post_victoria_dedup.qs")
+setdiff(dois, included_aug$doi)
+
+# None should be already in process
+already_processed <- read_csv("results_final/retrieved_hits.csv")
+intersect(dois, already_processed$doi)
+
+# Create dataframe for coding
+new_doi_pdfs <- included_aug %>%
+  filter(doi %in% dois) %>% 
+  mutate(filename = paste0(str_replace_all(coalesce(names(doi_lookup)[match(doi, doi_lookup)], doi), "/", "--"),".pdf")) %>% 
+  transmute(ID = doi, author, year, citation = CiteSource:::generate_apa_citation(author, year),
+            title, doi, status = "", filename) 
+
+# Rename files
+file.rename(file.path(PDF_folder, doi_df$pdf_name), file.path(PDF_folder, doi_df$filename))
+
+non_doi_df <- pdf_details %>% filter(!is_doi) %>% select(-DOI) %>% mutate(ID = str_remove(ID, "\\(.*") %>% 
+                                                                            str_replace_all("_", ";") %>% 
+                                                                            str_trim(),
+                                                                          filename = paste0("ID_", str_replace_all(ID, ";", "_"),".pdf"))
+
+# Merge another duplicate: 32695 with 38368; 42436
+included_aug <- included_aug %>% filter(duplicate_id %in% c("32695", "38368; 42436")) %>% 
+        summarise(across(c(author, title, abstract, pub_type, journal), get_longest),
+            across(c(citation_link, issue, volume, year, language), ~na.omit(unique(.x))[1]),
+            citation_count = list(tibble(source = database, citation_count = citation_count) %>%
+                                    filter(!is.na(citation_count))),
+            resource_link = list(tibble(source = database, resource_link = resource_link) %>%
+                                    filter(!is.na(resource_link))),
+            database = glue::glue_collapse(database, sep = "; "),
+            duplicate_id = glue::glue_collapse(duplicate_id, sep = "; "),
+            rowid = glue::glue_collapse(record_id, sep = "; ")) %>% 
+  bind_rows(included_aug %>% filter(!duplicate_id %in% c("32695", "38368; 42436")))
+
+# All duplicate IDs should match a retrieved result
+setdiff(non_doi_df$ID, included_aug$duplicate_id)
+# But not yet be processed
+intersect(non_doi_df$ID, already_processed$ID)
+
+non_doi_pdfs <- included_aug %>%
+  filter(duplicate_id %in% non_doi_df$ID) %>% 
+  mutate(filename = paste0("ID_", str_replace_all(duplicate_id, ";", "_"),".pdf")) %>% 
+  transmute(ID = duplicate_id, author, year, citation = CiteSource:::generate_apa_citation(author, year),
+            title, doi, status = "", filename) 
+
+file.rename(file.path(PDF_folder, non_doi_df$pdf_name), file.path(PDF_folder, non_doi_df$filename))
+
+new_pdfs <- bind_rows(new_doi_pdfs, non_doi_pdfs)
+
+all(file.exists(file.path(PDF_folder, new_pdfs$filename)))
+
+# Any overlap with current?
+new_pdfs %>% filter(doi %in% already_processed$doi, !is.na(doi)) %>% pull(doi)
+
+# Already uploaded from first round
+additions <- c("10.17159/sajs.2018/20170331", "10.18488/journal.11/2014.3.7/11.7.415.432", "10.22452/mjcs.vol29no2.5", "15703", "10.4236/ce.2012.34062", "10.5465/amle.2020.0332", "10.1108/raf-09-2021-0232", "10.1080/01900692.2021.2013258", "10.1109/tpc.2020.3029674", "10.3846/jbem.2018.6579", "10.3389/fpsyg.2021.745991", "2330", "2349", "2372", "2447", "2456", "2468", "2477", "2554", "2625", "10.1002/bse.3286", "10.1016/j.intman.2022.100969", "10.1016/j.jbvi.2022.e00314", "10.1371/journal.pone.0254656", "10.22495/cocv10i2art6", "10.31436/ijcs.v3i2.130", "32961", "33012", "33147", "33619", "33780", "33800", "33991", "34023", "34395", "34400", "34435", "34459", "34612", "34654", "34717", "34912", "35326", "35346", "35397", "35417", "35661", "10.2139/ssrn.2183095", "35781", "35857", "10.2139/ssrn.3412524", "35912", "35969", "35973", "36091", "36353", "36660", "37128", "37692", "37778", "37802", "38103", "38114", "38494", "38795", "38862", "39074", "39155", "39175", "39205", "39369", "3970", "39744", "39845", "40263", "40420", "40554", "40557", "40872", "41352", "41373", "4184", "42013", "43058", "43060", "43069", "43082; 43083", "43095", "43096", "43109", "43120", "43185", "43213", "43318", "43383", "43433", "4350", "43508", "10.1002/job.2570", "43585", "43603", "43609", "43613", "43659", "43707", "43741", "4674", "5568", "6214", "10.1037/apl0000277", "10.7287/peerj.preprints.2285v1", "9893")
+
+# Thus, not to be re-uploaded
+past_additions <- new_pdfs %>% filter(ID %in% additions)
+new_pdfs <- new_pdfs %>% filter(!ID %in% additions)
+past_additions <- new_pdfs %>% filter(doi %in% additions) %>% mutate(ID = doi, filename = paste0(str_replace_all(doi, "/", "--"),".pdf")) %>% bind_rows(past_additions)
+new_pdfs <- new_pdfs %>% filter(!doi %in% additions)
+
+elsewhere <- setdiff(additions, past_additions$ID)
+past_additions <- included_aug %>% filter(doi %in% elsewhere | duplicate_id %in% elsewhere) %>% 
+  mutate(ID = coalesce(doi, duplicate_id), filename = paste0(str_replace_all(ID, c(";", "/"), c("_", "--")),".pdf")) %>% 
+  transmute(ID, author, year, citation = CiteSource:::generate_apa_citation(author, year),
+            title, doi, status = "", filename) %>% bind_rows(past_additions)
+
+past_additions %>% write_csv("results_final/retrieved_hits_batch2.csv")
+
+# Remove files already added in past
+file.remove(file.path(PDF_folder, setdiff(list.files(PDF_folder), new_pdfs$filename)))
+
+# Flag ProQuest - incomplete, but previews sufficient for FT screening
+proquest_ids <- c("10679", "19367", "19442", "20634", "2336", "2397", "2504", "25244", "2552", "2574", "2617", "2622", "32591", "32645", "32680", "32695", "32771; 32647", "43266", "4364", "4405", "4595", "4617; 32716", "4652", "4669", "4733", "4761", "4774", "4785", "4797", "4970; 32690", "5120", "5139", "5194", "5303", "5361", "6044", "6367", "6497", "6787", "7430", "7436", "8537", "9062", "9521", "9990")
+new_pdfs$status[new_pdfs$ID %in% proquest_ids] <- "ProQuest preview"
+
+new_pdfs %>% write_csv("results_final/retrieved_hits_batch3.csv")
+
+all_processed <- bind_rows(already_processed %>% mutate(year = as.character(year)), new_pdfs, past_additions)
+
+```
+
+Download a few more
+
+```{r}
+victoria_input <- readxl::read_excel("Victoria manual retrieval WIP.xlsx")
+
+
+paywalls <- victoria_input %>% filter(ID %in% open$ID) %>% filter(str_detect(Status, "PAYW"))
+
+walk(paywalls$url, browseURL)
+
+PDF_folder <- rstudioapi::selectDirectory()
+pdf_names <- list.files(PDF_folder)
+pdf_details <- data.frame(pdf_name = pdf_names) %>% mutate(ID = str_remove(pdf_name, "\\.\\(.*") %>% str_remove(" -.*") %>% str_remove(fixed(".pdf")) %>% str_remove(fixed("ID_")),
+                                                           is_doi = str_detect(ID, "^10\\."), DOI = str_replace_all(ID, "--", "/"))
+
+next_additions <- included_aug %>% filter(doi %in% pdf_details$DOI) %>% 
+  mutate(ID = doi, filename = paste0(str_replace_all(doi, "/", "--"),".pdf")) %>% 
+  transmute(ID, author, year, citation = CiteSource:::generate_apa_citation(author, year),
+            title, doi, status = "", filename)
+
+next_additions %>% write_csv("results_final/retrieved_hits_batch4.csv")
+
+all_processed <- bind_rows(already_processed %>% mutate(year = as.character(year)), new_pdfs, past_additions, next_additions)
+
+victoria_input_outstanding <- victoria_input %>% filter(!ID %in% all_processed$ID)
+
+```
+
+
+# Separate file for next steps
+
+```{r}
+aom_abstracts <- included_aug %>% 
+  filter(!(doi %in% all_processed$ID | duplicate_id %in% all_processed$ID)) %>% 
+  filter(str_detect(doi, "10.5465/ambpp.*abstract")) %>%
+  mutate(ID = paste0("AOM_abs_", row_number()), filename = paste0(ID,".pdf")) %>% 
+  transmute(ID, author, year, citation = CiteSource:::generate_apa_citation(author, year),
+            title, abstract, doi, status = "", language = "", filename) %>% 
+  left_join(victoria_input_outstanding %>% select(doi, note = `Contact email`))
+
+aom_abstracts %>% write_csv("results_final/aom_abstracts.csv")
+
+
+aom_abstracts <- victoria_input_outstanding %>% filter(str_detect(doi, "10.5465/ambpp.*abstract"))
+
+open <- included_aug %>% filter(!(doi %in% all_processed$ID | duplicate_id %in% all_processed$ID))
+```
+
+

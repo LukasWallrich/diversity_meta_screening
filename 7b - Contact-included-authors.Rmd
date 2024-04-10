@@ -1,0 +1,229 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+After coding of bibliographic searches and backwards-chasing was completed, we contacted all corresponding authors (and other authors whose email addresses were available) of the publications included to ask for further sources - particularly recent and unpublished.
+
+# Prepare for contact
+
+```{r}
+citation <- function(bib, csl="chicago-author-date.csl", toformat="plain", cslrepo="https://raw.githubusercontent.com/citation-style-language/styles/master") {
+  if (!file.exists(bib)) {
+    message("Assuming input is literal bibtex entry")
+    tmpbib <- tempfile(fileext = ".bib")
+    on.exit(unlink(tmpbib), add=TRUE)
+    if(!validUTF8(bib)) {
+      bib <- iconv(bib, to="UTF-8")
+    }
+    writeLines(bib, tmpbib)
+    bib <- tmpbib
+  }
+  if (tools::file_ext(csl)!="csl") {
+    warning("CSL file name should end in '.csl'")
+  }
+  if (!file.exists(csl)) {
+    cslurl <- file.path(cslrepo, csl)
+    message(paste("Downling CSL from", cslurl))
+    cslresp <- httr::GET(cslurl, httr::write_disk(csl))
+    if(httr::http_error(cslresp)) {
+      stop(paste("Could not download CSL.", "Code:", httr::status_code(cslresp)))
+    }
+  }
+  tmpcit <- tempfile(fileext = ".md")
+  on.exit(unlink(tmpcit), add=TRUE)
+  
+  writeLines(c("---","nocite: '@*'","---"), tmpcit)
+  rmarkdown::find_pandoc()
+  command <- paste(shQuote(rmarkdown:::pandoc()), 
+                   "--citeproc",
+                   "--to", shQuote(toformat),
+                   "--csl", shQuote(csl),
+                   "--bibliography", shQuote(bib), 
+                  shQuote(tmpcit))
+  rmarkdown:::with_pandoc_safe_environment({
+    result <- system(command, intern = TRUE)
+    Encoding(result) <- "UTF-8"
+  })
+  result
+}
+```
+
+```{r}
+library(tidyverse)
+df <- readxl::read_excel("FT-screened-for-author-contact.xlsx", "Author contacts & refs - final") %>% 
+  filter(Included, Email != "OUT")
+
+df <- df %>% mutate(reference = map_chr(BibTex, ~citation(.x, "helpers/apa.csl", toformat = "html") %>% paste(collapse = " ")))
+
+df$reference <- df$reference %>% str_remove_all(fixed('amp<span class="math inline">$\\mathsemicolon$</span>')) %>% 
+  str_remove_all(fixed('Amp<span class="math inline">$\\mathsemicolon$</span>')) %>% 
+  str_replace_all("<\\/?(div).*?>", "") %>% str_squish() %>% 
+  str_replace("<a h", "<a style = 'color:#999999;' h")
+
+df <- df %>% mutate(Email = tolower(Email))
+
+# We had already contacted some authors with specific questions - which we needed to acknowledge in this round
+# Got list of authors we had been in touch with by downloading all eml files and running
+## grep -E "^From:|^To:" *.eml | sed -E 's/^From: //' | sed -E 's/^To: //' | grep -E -o "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,6}\b" | tr '[:upper:]' '[:lower:]' > emails.txt
+## sort emails.txt | uniq > unique_emails.txt
+
+specifically_contacted <- read_csv("helpers/emails_specifically_contacted.txt", col_names = F) %>% pull(X1)
+
+sep_df <- df %>% mutate(`First name` = str_replace_all(`First name`, ",", ";")) %>% 
+  separate_longer_delim(c(`First name`, Email), delim = regex(";|&")) %>% 
+  mutate(Email = str_replace_all(Email, ",", ";") %>% str_squish(),
+         `First name` = str_squish(`First name`))
+
+email_count <- sep_df %>% count(Email) %>% 
+  mutate(already_contacted = Email %in% specifically_contacted)
+
+specifically_contacted_IDs <- sep_df %>% 
+  mutate(already_contacted = Email %in% specifically_contacted) %>% 
+  filter(already_contacted) %>% pull(ID) %>% unique()
+
+##
+## BEWARE - the logic below should not result in multiple emails to the same auhtor,
+## yet it does. Dealt with manually, but should be fixed before reusing the code.
+##
+
+# Filter for combinations where authors only appear in same combination across one or more papers
+consistent_authors <-  df %>% filter(ID %in% (sep_df %>% left_join(email_count) %>% 
+  group_by(ID) %>% filter(min(n) == max(n)) %>% pull(ID))) %>%  
+  mutate(already_contacted = ID %in% specifically_contacted_IDs,
+         pub_year = str_extract(reference, "\\d{4}") %>% as.numeric(),
+         names = map(ID, ~sep_df %>% filter(ID == .x) %>% pull(`First name`)),
+         emails = map(ID, ~sep_df %>% filter(ID == .x) %>% pull(Email))) %>% 
+  arrange(desc(pub_year)) %>% 
+  group_by(Email) %>% 
+  summarise(ID = first(ID), `First name` = first(`First name`), Email = first(Email),
+            names = list(first(names)), emails = list(first(emails)),
+            reference = paste(paste("<li>", reference, "</li>"), collapse = "\n"),
+            already_contacted = any(already_contacted),
+            latest = max(pub_year))
+
+others <- sep_df %>% filter(!ID %in% consistent_authors$ID) %>%
+  mutate(already_contacted = ID %in% specifically_contacted_IDs,
+                  pub_year = str_extract(reference, "\\d{4}") %>% as.numeric()) %>% 
+  group_by(Email) %>% 
+  summarise(`First name` = first(`First name`), Email = first(Email),
+            reference = paste(paste("<li>", reference, "</li>"), collapse = "\n"),
+            already_contacted = any(already_contacted),
+            latest = max(pub_year))
+
+```
+
+# Create Outlook emails
+
+We used Apple Script to automatically create the email drafts in Outlook, so that we only had to review them manually.
+
+```{r}
+source("helpers/author_email_parts.R")
+
+send_email <- function(subject, content, names, emails, send = FALSE) {
+    script_path <- "applescript_send_email.scpt"  # Update with the correct path to your script
+    send_flag <- ifelse(send, "true", "false")
+
+    # Combine names and emails
+    recipient_args <- mapply(function(name, email) c(shQuote(name), shQuote(email)), names, emails, SIMPLIFY = FALSE)
+    recipient_args <- unlist(recipient_args)
+
+    args <- c(shQuote(subject), shQuote(content), send_flag, recipient_args)
+    system2("osascript", args = c(script_path, args), wait = FALSE)
+}
+```
+
+```{r}
+# To facilitate resuming after interrupt
+i <- 1
+for (i in 1:nrow(consistent_authors)) {
+  email <- glue::glue("
+                      {para_pre}
+                      <p>Dear {consistent_authors$`First name`[i]},</p>
+                      {if (consistent_authors$already_contacted[i]) already_contacted_caveat else ''}
+                      <p>{tldr}</p>
+                      <p>{background1}</p>
+                      <p><ul>{consistent_authors$reference[i]}</ul></p>
+                      {if (consistent_authors$latest[i] < 2015) time_caveat else ''}
+                      <p>{background2}</p>
+                      <p>{unpublished}</p>
+                      <p>{questions}</p>
+                      <p>{greeting}</p>
+                      {para_post}
+                      {signature}
+    
+    ") %>% str_squish()
+  
+  send_email(subject = "Meta-analysis on diversity and team-performance: can you contribute additional (recent/unpublished) literature?",
+             content = email,
+             names = consistent_authors$names[[i]],
+             emails = consistent_authors$emails[[i]],
+             !consistent_authors$already_contacted[i])
+}
+```
+
+```{r}
+# To facilitate resuming after interrupt
+i <- 1
+for (i in 1:nrow(others)) {
+  
+  # Do not duplicate emails
+   if (others$Email[i] %in% c(intersect(others$Email, consistent_authors$emails %>% unlist()),  "ac.homan@psy.vu.nl")) next
+  
+  email <- glue::glue("
+                      {para_pre}
+                      <p>Dear {others$`First name`[i]},</p>
+                      {if (others$already_contacted[i]) already_contacted_caveat else ''}
+                      <p>{tldr}</p>
+                      <p>{background1}</p>
+                      <p><ul>{others$reference[i]}</ul></p>
+                      {if (others$latest[i] < 2015) time_caveat else ''}
+                      <p>{background2}</p>
+                      <p>{unpublished}</p>
+                      <p>{questions}</p>
+                      <p>{greeting}</p>
+                      {para_post}
+                      {signature}
+    
+    ") %>% str_squish()
+  
+  send_email(subject = "Meta-analysis on diversity and team-performance: can you contribute additional (recent/unpublished) literature?",
+             content = email,
+             names = others$`First name`[i],
+             emails = others$Email[i],
+             !others$already_contacted[i])
+}
+```
+
+```{r}
+
+to_merge <- others %>% filter(`First name` %in% c("Mengge", "Eric", "Amy", "Sangok", "Ci-Rong", "Tomohiko", "Wein-Hong", "Rebecca", "David")) %>% mutate(already_contacted = TRUE)
+
+i <- 1
+for (i in 1:nrow(to_merge)) {
+  
+  email <- glue::glue("
+                      {para_pre}
+                      <p>Dear {to_merge$`First name`[i]},</p>
+                      {if (to_merge$already_contacted[i]) already_contacted_caveat else ''}
+                      <p>{tldr}</p>
+                      <p>{background1}</p>
+                      <p><ul>{to_merge$reference[i]}</ul></p>
+                      {if (to_merge$latest[i] < 2015) time_caveat else ''}
+                      <p>{background2}</p>
+                      <p>{unpublished}</p>
+                      <p>{questions}</p>
+                      <p>{greeting}</p>
+                      {para_post}
+                      {signature}
+    
+    ") %>% str_squish()
+  
+  send_email(subject = "Meta-analysis on diversity and team-performance: can you contribute additional (recent/unpublished) literature?",
+             content = email,
+             names = to_merge$`First name`[i],
+             emails = to_merge$Email[i],
+             !to_merge$already_contacted[i])
+}
+```
+
